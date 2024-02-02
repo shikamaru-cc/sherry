@@ -10,6 +10,10 @@ void *srmalloc(size_t sz) {
     return p;
 }
 
+void *srrealloc(void *ptr, size_t sz) {
+    return realloc(ptr, sz);
+}
+
 void srfree(void *p) {
     // printf("srfree at: %ld\n", p);
     free(p);
@@ -29,20 +33,17 @@ typedef struct srRoutine {
     struct srRoutine *next;
 } srRoutine;
 
-int nextrid = 0;
-
-srRoutine *newRoutine(void *(*fn)(void *), void *arg) {
+srRoutine *newRoutine(int rid, void *(*fn)(void *), void *arg) {
     /* p is the end of the routine's stack. */
     char *p = srmalloc(sizeof(srRoutine) + SHERRY_STACK_SIZE);
-
     /* the start SHERRY_STACK_SIZE bytes are used as the routine's
      * stack. */
     srRoutine *r = (srRoutine *)(p + SHERRY_STACK_SIZE);
-    r->rid = nextrid; nextrid++;
+    r->rid = rid;
     r->fn = fn;
     r->arg = arg;
+    r->prev = NULL;
     r->next = NULL;
-
     return r;
 }
 
@@ -99,9 +100,11 @@ srRoutine *dequeueRoutineQ(srRoutineQ *queue) {
 void *getstack(srRoutine *r) { return r; }
 
 typedef struct srScheduler {
-    srRoutine *rtmain; /* the fake main routine */
-    srRoutine *rtrunning; /* the current running routine */
-    srRoutineQ rtready;
+    int sizeroutines;     // the size of array routines
+    srRoutine **routines; // all register routines
+    srRoutine *main;      // the fake main routine
+    srRoutine *running;   // the current running routine
+    srRoutineQ ready;     // routines ready to run
 } srScheduler;
 
 srScheduler *S;
@@ -109,11 +112,47 @@ srScheduler *S;
 char _tmpstack[4096];
 char *tmpstack = _tmpstack + sizeof(_tmpstack);
 
+/* add a new routine to routines array. */
+srRoutine *addRoutine(void *(*fn)(void *), void *arg) {
+    /* TODO: O(n) now, make it O(1)? */
+    int rid = -1;
+    for (int i = 0; i < S->sizeroutines; i++) {
+        if (S->routines[i] == NULL) {
+            rid = i;
+            break;
+        }
+    }
+    /* there is no available slot, realloc routines array. */
+    if (rid == -1) {
+        size_t oldsize = S->sizeroutines;
+        size_t newsize = S->sizeroutines * 2;
+        S->routines = srrealloc(S->routines, newsize * sizeof(srRoutine *));
+        memset(S->routines + oldsize, 0,
+            (newsize - oldsize) * sizeof(srRoutine *));
+        S->sizeroutines = newsize;
+        rid = oldsize;
+    }
+    srRoutine *rt = newRoutine(rid, fn, arg);
+    S->routines[rid] = rt;
+    return rt;
+}
+
+void delRoutine(int rid) {
+    if (rid < 0 || rid >= S->sizeroutines || S->routines[rid] == NULL)
+        return;
+
+    srRoutine *rt = S->routines[rid];
+    freeRoutine(rt);
+    S->routines[rid] = NULL;
+
+    /* TODO: shrink the array size. */
+}
+
 /* resume one routine from ready list */
 void resume(void) {
-    srRoutine *next = dequeueRoutineQ(&S->rtready);
+    srRoutine *next = dequeueRoutineQ(&S->ready);
     if (next != NULL) {
-        S->rtrunning = next;
+        S->running = next;
         siglongjmp(next->ctx, 1);
     }
 }
@@ -124,11 +163,11 @@ void resume(void) {
 
 int srspawn(void *(*fn)(void *), void *arg) {
 
-    srRoutine *newr = newRoutine(fn, arg);
+    srRoutine *newr = addRoutine(fn, arg);
 
     /* interrupt current running routine */
-    srRoutine *curr = S->rtrunning;
-    enqueueRoutineQ(&S->rtready, curr);
+    srRoutine *curr = S->running;
+    enqueueRoutineQ(&S->ready, curr);
 
     if (sigsetjmp(curr->ctx, 0)) {
         /* If the return value of sigsetjmp is greater than zero,
@@ -140,12 +179,12 @@ int srspawn(void *(*fn)(void *), void *arg) {
 
     /* The return value of sigsetjmp is zero means that we continue the
      * current context, spawn the new routine and run it. */
-    S->rtrunning = newr;
+    S->running = newr;
 
     /* switch stack here, then we cannot access fn and arg from stack
      * params, we call it through the global scheduler. */
     switchsp(getstack(newr));
-    S->rtrunning->fn(S->rtrunning->arg);
+    S->running->fn(S->running->arg);
 
     /* the routine ends, release resources and give control back to
      * scheduler. */
@@ -153,7 +192,7 @@ int srspawn(void *(*fn)(void *), void *arg) {
     /* we should not free the memory of current stack, so we switch to
      * the global temp stack first. */
     switchsp(tmpstack);
-    freeRoutine(S->rtrunning);
+    delRoutine(S->running->rid);
 
     resume();
 
@@ -161,21 +200,30 @@ int srspawn(void *(*fn)(void *), void *arg) {
 }
 
 void sryield(void) {
-    srRoutine *curr = S->rtrunning;
-    enqueueRoutineQ(&S->rtready, curr);
+    srRoutine *curr = S->running;
+    enqueueRoutineQ(&S->ready, curr);
     if (!sigsetjmp(curr->ctx, 0))
         resume();
 }
 
 void srinit(void) {
     S = srmalloc(sizeof(srScheduler));
-    S->rtmain = newRoutine(NULL, NULL);
-    S->rtrunning = S->rtmain;
-    initRoutineQ(&S->rtready);
+
+    const size_t sz = 1000; // initial S->routines size
+    S->sizeroutines = sz;
+    S->routines = srmalloc(sizeof(srRoutine *) * sz);
+    memset(S->routines, 0, sizeof(srRoutine *) * sz);
+
+    /* set current running to the fake main routine. */
+    S->main = addRoutine(NULL, NULL);
+    S->running = S->main;
+
+    initRoutineQ(&S->ready);
 }
 
 void srexit(void) {
-    freeRoutine(S->rtmain);
+    delRoutine(S->main->rid);
+    srfree(S->routines);
     srfree(S);
 }
 
@@ -204,7 +252,7 @@ void testsimple(void) {
     srspawn(testf, &arg3);
     srspawn(testf, &arg4);
 
-    while (S->rtready.len > 0)
+    while (S->ready.len > 0)
         sryield();
 }
 
@@ -218,13 +266,13 @@ void *benchf(void *arg) {
 void benchswitch(void) {
     for (size_t i = 0; i < 10000; i++)
         srspawn(benchf, (void *)1000);
-    while (S->rtready.len > 0)
+    while (S->ready.len > 0)
         sryield();
 }
 
 int main(void) {
     srinit();
-    // benchswitch();
-    testsimple();
+    // testsimple();
+    benchswitch();
     srexit();
 }
