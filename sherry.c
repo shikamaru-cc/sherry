@@ -19,6 +19,57 @@ void srfree(void *p) {
     free(p);
 }
 
+/* Takes a pointer to a member variable and computes pointer to the structure
+ * that contains it. 'type' is type of the structure, not the member.
+ * NOTE: This macro code from github.com/sustrik/libmill. */
+#define get_cont(ptr, type, member) \
+    (ptr ? ((type*) (((char*) ptr) - offsetof(type, member))) : NULL)
+
+struct queueNode {
+    struct queueNode *prev;
+    struct queueNode *next;
+};
+
+struct queue {
+    struct queueNode *head;
+    struct queueNode *tail;
+};
+
+void queueInit(struct queue *q) {
+    q->head = NULL;
+    q->tail = NULL;
+}
+
+static inline int queueEmpty(struct queue *q) { return q->head == NULL; }
+
+void enqueue(struct queue *q, struct queueNode *node) {
+    node->prev = q->tail;
+    node->next = NULL;
+    q->tail = node;
+    if (node->prev != NULL)
+        node->prev->next = node;
+    if (q->head == NULL)
+        q->head = node;
+}
+
+struct queueNode *dequeue(struct queue *q) {
+    struct queueNode *node = q->head;
+
+    if (node == NULL)
+        return NULL;
+
+    if (node->next != NULL)
+        node->next->prev = NULL;
+
+    q->head = node->next;
+    q->tail = q->tail == node ? NULL : q->tail;
+
+    node->prev = NULL;
+    node->next = NULL;
+
+    return node;
+}
+
 typedef jmp_buf srctx;
 
 #define SHERRY_STACK_SIZE 4096
@@ -29,8 +80,7 @@ typedef struct srRoutine {
     void *(*fn)(void *);
     void *arg;
     /* srRoutine is a doule-linked list based queue in the scheduler now. */
-    struct srRoutine *prev;
-    struct srRoutine *next;
+    struct queueNode qnode;
 } srRoutine;
 
 srRoutine *newRoutine(int rid, void *(*fn)(void *), void *arg) {
@@ -42,59 +92,14 @@ srRoutine *newRoutine(int rid, void *(*fn)(void *), void *arg) {
     r->rid = rid;
     r->fn = fn;
     r->arg = arg;
-    r->prev = NULL;
-    r->next = NULL;
+    r->qnode.prev = NULL;
+    r->qnode.next = NULL;
     return r;
 }
 
 void freeRoutine(srRoutine *r) {
     char *p = (char *)r - SHERRY_STACK_SIZE;
     srfree(p);
-}
-
-typedef struct srRoutineQ {
-    size_t len;
-    srRoutine *head;
-    srRoutine *tail;
-} srRoutineQ;
-
-static inline void initRoutineQ(srRoutineQ *queue) {
-    queue->len = 0;
-    queue->head = queue->tail = NULL;
-}
-
-void enqueueRoutineQ(srRoutineQ *queue, srRoutine *new) {
-    queue->len++;
-    if (queue->head == NULL && queue->tail == NULL) {
-        queue->head = queue->tail = new;
-        return;
-    }
-    new->prev = queue->tail;
-    queue->tail->next = new;
-    queue->tail = new;
-}
-
-srRoutine *dequeueRoutineQ(srRoutineQ *queue) {
-    if (queue->len == 0)
-        return NULL;
-
-    queue->len--;
-
-    srRoutine *rt = queue->head;
-
-    if (queue->head == queue->tail) {
-        queue->head = NULL;
-        queue->tail = NULL;
-    }
-    else {
-        queue->head = rt->next;
-        queue->head->prev = NULL;
-    }
-
-    rt->prev = NULL;
-    rt->next = NULL;
-
-    return rt;
 }
 
 void *getstack(srRoutine *r) { return r; }
@@ -104,7 +109,7 @@ typedef struct srScheduler {
     srRoutine **routines; // all register routines
     srRoutine *main;      // the fake main routine
     srRoutine *running;   // the current running routine
-    srRoutineQ ready;     // routines ready to run
+    struct queue readyq;     // routines ready to run
 } srScheduler;
 
 srScheduler *S;
@@ -150,7 +155,8 @@ void delRoutine(int rid) {
 
 /* resume one routine from ready list */
 void resume(void) {
-    srRoutine *next = dequeueRoutineQ(&S->ready);
+    struct queueNode *node = dequeue(&S->readyq);
+    srRoutine *next = get_cont(node, srRoutine, qnode);
     if (next != NULL) {
         S->running = next;
         siglongjmp(next->ctx, 1);
@@ -167,7 +173,7 @@ int srspawn(void *(*fn)(void *), void *arg) {
 
     /* interrupt current running routine */
     srRoutine *curr = S->running;
-    enqueueRoutineQ(&S->ready, curr);
+    enqueue(&S->readyq, &curr->qnode);
 
     if (sigsetjmp(curr->ctx, 0)) {
         /* If the return value of sigsetjmp is greater than zero,
@@ -201,7 +207,7 @@ int srspawn(void *(*fn)(void *), void *arg) {
 
 void sryield(void) {
     srRoutine *curr = S->running;
-    enqueueRoutineQ(&S->ready, curr);
+    enqueue(&S->readyq, &curr->qnode);
     if (!sigsetjmp(curr->ctx, 0))
         resume();
 }
@@ -218,7 +224,7 @@ void srinit(void) {
     S->main = addRoutine(NULL, NULL);
     S->running = S->main;
 
-    initRoutineQ(&S->ready);
+    queueInit(&S->readyq);
 }
 
 void srexit(void) {
@@ -252,7 +258,7 @@ void testsimple(void) {
     srspawn(testf, &arg3);
     srspawn(testf, &arg4);
 
-    while (S->ready.len > 0)
+    while (!queueEmpty(&S->readyq))
         sryield();
 }
 
@@ -266,7 +272,7 @@ void *benchf(void *arg) {
 void benchswitch(void) {
     for (size_t i = 0; i < 10000; i++)
         srspawn(benchf, (void *)1000);
-    while (S->ready.len > 0)
+    while (!queueEmpty(&S->readyq))
         sryield();
 }
 
