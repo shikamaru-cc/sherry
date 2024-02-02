@@ -24,6 +24,8 @@ typedef struct srRoutine {
     srctx ctx;
     void *(*fn)(void *);
     void *arg;
+    /* srRoutine is a doule-linked list based queue in the scheduler now. */
+    struct srRoutine *prev;
     struct srRoutine *next;
 } srRoutine;
 
@@ -33,7 +35,7 @@ srRoutine *newRoutine(void *(*fn)(void *), void *arg) {
     /* p is the end of the routine's stack. */
     char *p = srmalloc(sizeof(srRoutine) + SHERRY_STACK_SIZE);
 
-    /* the start SHERRY_STACK_SIZE memory is used as the routine's
+    /* the start SHERRY_STACK_SIZE bytes are used as the routine's
      * stack. */
     srRoutine *r = (srRoutine *)(p + SHERRY_STACK_SIZE);
     r->rid = nextrid; nextrid++;
@@ -49,28 +51,49 @@ void freeRoutine(srRoutine *r) {
     srfree(p);
 }
 
-/* TODO: now is O(n), make it O(1) */
-void enqueueRoutine(srRoutine **queue, srRoutine *new) {
-    while (*queue)
-        queue = &(*queue)->next;
-    *queue = new;
+typedef struct srRoutineQ {
+    size_t len;
+    srRoutine *head;
+    srRoutine *tail;
+} srRoutineQ;
+
+static inline void initRoutineQ(srRoutineQ *queue) {
+    queue->len = 0;
+    queue->head = queue->tail = NULL;
 }
 
-srRoutine *dequeueRoutine(srRoutine **queue) {
-    srRoutine *ret = *queue;
-    if (ret == NULL) return NULL;
-    *queue = ret->next;
-    ret->next = NULL;
-    return ret;
-}
-
-int numRoutines(srRoutine *queue) {
-    int i = 0;
-    while (queue) {
-        i++;
-        queue = queue->next;
+void enqueueRoutineQ(srRoutineQ *queue, srRoutine *new) {
+    queue->len++;
+    if (queue->head == NULL && queue->tail == NULL) {
+        queue->head = queue->tail = new;
+        return;
     }
-    return i;
+    new->prev = queue->tail;
+    queue->tail->next = new;
+    queue->tail = new;
+}
+
+srRoutine *dequeueRoutineQ(srRoutineQ *queue) {
+    if (queue->len == 0)
+        return NULL;
+
+    queue->len--;
+
+    srRoutine *rt = queue->head;
+
+    if (queue->head == queue->tail) {
+        queue->head = NULL;
+        queue->tail = NULL;
+    }
+    else {
+        queue->head = rt->next;
+        queue->head->prev = NULL;
+    }
+
+    rt->prev = NULL;
+    rt->next = NULL;
+
+    return rt;
 }
 
 void *getstack(srRoutine *r) { return r; }
@@ -78,7 +101,7 @@ void *getstack(srRoutine *r) { return r; }
 typedef struct srScheduler {
     srRoutine *rtmain; /* the fake main routine */
     srRoutine *rtrunning; /* the current running routine */
-    srRoutine *rtready;
+    srRoutineQ rtready;
 } srScheduler;
 
 srScheduler *S;
@@ -88,7 +111,7 @@ char *tmpstack = _tmpstack + sizeof(_tmpstack);
 
 /* resume one routine from ready list */
 void resume(void) {
-    srRoutine *next = dequeueRoutine(&S->rtready);
+    srRoutine *next = dequeueRoutineQ(&S->rtready);
     if (next != NULL) {
         S->rtrunning = next;
         siglongjmp(next->ctx, 1);
@@ -105,7 +128,7 @@ int srspawn(void *(*fn)(void *), void *arg) {
 
     /* interrupt current running routine */
     srRoutine *curr = S->rtrunning;
-    enqueueRoutine(&S->rtready, curr);
+    enqueueRoutineQ(&S->rtready, curr);
 
     if (sigsetjmp(curr->ctx, 0)) {
         /* If the return value of sigsetjmp is greater than zero,
@@ -119,8 +142,13 @@ int srspawn(void *(*fn)(void *), void *arg) {
      * current context, spawn the new routine and run it. */
     S->rtrunning = newr;
 
+    /* switch stack here, then we cannot access fn and arg from stack
+     * params, we call it through the global scheduler. */
     switchsp(getstack(newr));
     S->rtrunning->fn(S->rtrunning->arg);
+
+    /* the routine ends, release resources and give control back to
+     * scheduler. */
 
     /* we should not free the memory of current stack, so we switch to
      * the global temp stack first. */
@@ -134,7 +162,7 @@ int srspawn(void *(*fn)(void *), void *arg) {
 
 void sryield(void) {
     srRoutine *curr = S->rtrunning;
-    enqueueRoutine(&S->rtready, curr);
+    enqueueRoutineQ(&S->rtready, curr);
     if (!sigsetjmp(curr->ctx, 0))
         resume();
 }
@@ -143,7 +171,7 @@ void srinit(void) {
     S = srmalloc(sizeof(srScheduler));
     S->rtmain = newRoutine(NULL, NULL);
     S->rtrunning = S->rtmain;
-    S->rtready = NULL;
+    initRoutineQ(&S->rtready);
 }
 
 void srexit(void) {
@@ -165,9 +193,7 @@ void *testf(void *arg) {
     return NULL;
 }
 
-int main(void) {
-    srinit();
-
+void testsimple(void) {
     struct testArg arg1 = {"sherry routine 1", 5};
     struct testArg arg2 = {"sherry routine 2", 3};
     struct testArg arg3 = {"sherry routine 3", 10};
@@ -178,8 +204,27 @@ int main(void) {
     srspawn(testf, &arg3);
     srspawn(testf, &arg4);
 
-    while (numRoutines(S->rtready) > 0)
+    while (S->rtready.len > 0)
         sryield();
+}
 
+void *benchf(void *arg) {
+    size_t cnt = (size_t)arg;
+    for (size_t i = 0; i < cnt; i++)
+        sryield();
+    return NULL;
+}
+
+void benchswitch(void) {
+    for (size_t i = 0; i < 10000; i++)
+        srspawn(benchf, (void *)1000);
+    while (S->rtready.len > 0)
+        sryield();
+}
+
+int main(void) {
+    srinit();
+    // benchswitch();
+    testsimple();
     srexit();
 }
