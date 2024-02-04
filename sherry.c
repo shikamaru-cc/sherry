@@ -25,155 +25,216 @@ void srfree(void *p) {
 #define get_cont(ptr, type, member) \
     (ptr ? ((type*) (((char*) ptr) - offsetof(type, member))) : NULL)
 
-struct queueNode {
-    struct queueNode *prev;
-    struct queueNode *next;
+struct listNode {
+    struct listNode *prev;
+    struct listNode *next;
 };
 
-struct queue {
-    struct queueNode *head;
-    struct queueNode *tail;
+struct list {
+    struct listNode *head;
+    struct listNode *tail;
 };
 
-void queueInit(struct queue *q) {
-    q->head = NULL;
-    q->tail = NULL;
+/* True is the list has no items. */
+#define listEmpty(self) (!((self)->head))
+
+/* Returns iterator to the first item in the list or NULL if
+   the list is empty. */
+#define listBegin(self) ((self)->head)
+
+/* Returns iterator to one past the item pointed to by 'it'. */
+#define listNext(it) ((it)->next)
+
+void listInit(struct list *l) {
+    l->head = NULL;
+    l->tail = NULL;
 }
 
-static inline int queueEmpty(struct queue *q) { return q->head == NULL; }
-
-void enqueue(struct queue *q, struct queueNode *node) {
-    node->prev = q->tail;
-    node->next = NULL;
-    q->tail = node;
-    if (node->prev != NULL)
-        node->prev->next = node;
-    if (q->head == NULL)
-        q->head = node;
+void listInsert(struct list *self, struct listNode *item, struct listNode *it) {
+    item->prev = it ? it->prev : self->tail;
+    item->next = it;
+    if(item->prev)
+        item->prev->next = item;
+    if(item->next)
+        item->next->prev = item;
+    if(!self->head || self->head == it)
+        self->head = item;
+    if(!it)
+        self->tail = item;
 }
 
-struct queueNode *dequeue(struct queue *q) {
-    struct queueNode *node = q->head;
+struct listNode *listErase(struct list *self, struct listNode *item) {
+    struct listNode *next;
 
+    if(item->prev)
+        item->prev->next = item->next;
+    else
+        self->head = item->next;
+    if(item->next)
+        item->next->prev = item->prev;
+    else
+        self->tail = item->prev;
+
+    next = item->next;
+
+    item->prev = NULL;
+    item->next = NULL;
+
+    return next;
+}
+
+void listEnqueue(struct list *q, struct listNode *node) {
+    listInsert(q, node, NULL);
+}
+
+struct listNode *listDequeue(struct list *q) {
+    struct listNode *node = listBegin(q);
     if (node == NULL)
         return NULL;
-
-    if (node->next != NULL)
-        node->next->prev = NULL;
-
-    q->head = node->next;
-    q->tail = q->tail == node ? NULL : q->tail;
-
-    node->prev = NULL;
-    node->next = NULL;
-
+    listErase(q, node);
     return node;
 }
+
+struct message {
+    int senderid;
+    int receiverid;
+    int msgtype;
+    void *payload;
+    size_t size;
+    struct listNode node;
+};
 
 typedef jmp_buf srctx;
 
 #define SHERRY_STACK_SIZE 4096
 
-typedef struct srRoutine {
-    int rid; /* routine id */
-    srctx ctx;
-    void *(*fn)(void *);
-    void *arg;
-    /* srRoutine is a doule-linked list based queue in the scheduler now. */
-    struct queueNode qnode;
-} srRoutine;
+/* all posible actor status */
+#define SHERRY_STATE_DEAD       0
+#define SHERRY_STATE_READY      1
+#define SHERRY_STATE_RUNNING    2
+#define SHERRY_STATE_WAIT_MSG   3
 
-srRoutine *newRoutine(int rid, void *(*fn)(void *), void *arg) {
+typedef struct actor {
+    int rid;              // routine id
+    int status;           // actor current status
+    srctx ctx;            // routine running context
+    void *(*fn)(void *);  // main function need to run
+    void *arg;            // args for main function
+    struct list mailbox;  // a queue of received messages in this actor
+    struct listNode node; // actor is a doule-linked list based
+                          // queue in the scheduler now.
+} actor;
+
+actor *newActor(int rid, void *(*fn)(void *), void *arg) {
     /* p is the end of the routine's stack. */
-    char *p = srmalloc(sizeof(srRoutine) + SHERRY_STACK_SIZE);
+    char *p = srmalloc(sizeof(actor) + SHERRY_STACK_SIZE);
     /* the start SHERRY_STACK_SIZE bytes are used as the routine's
      * stack. */
-    srRoutine *r = (srRoutine *)(p + SHERRY_STACK_SIZE);
+    actor *r = (actor *)(p + SHERRY_STACK_SIZE);
     r->rid = rid;
+    r->status = SHERRY_STATE_READY;
     r->fn = fn;
     r->arg = arg;
-    r->qnode.prev = NULL;
-    r->qnode.next = NULL;
+    r->node.prev = NULL;
+    r->node.next = NULL;
     return r;
 }
 
-void freeRoutine(srRoutine *r) {
+void freeActor(actor *r) {
     char *p = (char *)r - SHERRY_STACK_SIZE;
     srfree(p);
 }
 
-void *getstack(srRoutine *r) { return r; }
+void *actorStack(actor *r) { return r; }
 
-typedef struct srScheduler {
-    int sizeroutines;     // the size of array routines
-    srRoutine **routines; // all register routines
-    srRoutine *main;      // the fake main routine
-    srRoutine *running;   // the current running routine
-    struct queue readyq;     // routines ready to run
-} srScheduler;
+typedef struct scheduler {
+    int sizeactors;     // the size of array routines
+    actor **actors; // all register routines
+    actor *main;      // the fake main routine
+    actor *running;   // the current running routine
+    struct list readyq; // routines ready to run
+    struct list waitq; // blocked actors
+} scheduler;
 
-srScheduler *S;
+scheduler *S;
 
 char _tmpstack[4096];
 char *tmpstack = _tmpstack + sizeof(_tmpstack);
 
 /* add a new routine to routines array. */
-srRoutine *addRoutine(void *(*fn)(void *), void *arg) {
+actor *addActor(void *(*fn)(void *), void *arg) {
     /* TODO: O(n) now, make it O(1)? */
     int rid = -1;
-    for (int i = 0; i < S->sizeroutines; i++) {
-        if (S->routines[i] == NULL) {
+    for (int i = 0; i < S->sizeactors; i++) {
+        if (S->actors[i] == NULL) {
             rid = i;
             break;
         }
     }
     /* there is no available slot, realloc routines array. */
     if (rid == -1) {
-        size_t oldsize = S->sizeroutines;
-        size_t newsize = S->sizeroutines * 2;
-        S->routines = srrealloc(S->routines, newsize * sizeof(srRoutine *));
-        memset(S->routines + oldsize, 0,
-            (newsize - oldsize) * sizeof(srRoutine *));
-        S->sizeroutines = newsize;
+        size_t oldsize = S->sizeactors;
+        size_t newsize = S->sizeactors * 2;
+        S->actors = srrealloc(S->actors, newsize * sizeof(actor *));
+        memset(S->actors + oldsize, 0,
+            (newsize - oldsize) * sizeof(actor *));
+        S->sizeactors = newsize;
         rid = oldsize;
     }
-    srRoutine *rt = newRoutine(rid, fn, arg);
-    S->routines[rid] = rt;
+    actor *rt = newActor(rid, fn, arg);
+    S->actors[rid] = rt;
     return rt;
 }
 
-void delRoutine(int rid) {
-    if (rid < 0 || rid >= S->sizeroutines || S->routines[rid] == NULL)
+void delActor(int rid) {
+    if (rid < 0 || rid >= S->sizeactors || S->actors[rid] == NULL)
         return;
 
-    srRoutine *rt = S->routines[rid];
-    freeRoutine(rt);
-    S->routines[rid] = NULL;
+    actor *rt = S->actors[rid];
+    freeActor(rt);
+    S->actors[rid] = NULL;
 
     /* TODO: shrink the array size. */
 }
 
+/* set the actor to running state and enqueue it to readyq. */
+void setReady(actor *a) {
+    a->status = SHERRY_STATE_READY;
+    listEnqueue(&S->readyq, &a->node);
+}
+
+void setRunning(actor *a) {
+    a->status = SHERRY_STATE_RUNNING;
+    S->running = a;
+}
+
 /* resume one routine from ready list */
 void resume(void) {
-    struct queueNode *node = dequeue(&S->readyq);
-    srRoutine *next = get_cont(node, srRoutine, qnode);
+    struct listNode *node = listDequeue(&S->readyq);
+    actor *next = get_cont(node, actor, node);
     if (next != NULL) {
-        S->running = next;
+        setRunning(next);
         siglongjmp(next->ctx, 1);
     }
+}
+
+void yield(void) {
+    actor *a = S->running;
+    if (!sigsetjmp(a->ctx, 0))
+        resume();
 }
 
 #define switchsp(sp) do { \
         asm volatile ("movq %0, %%rsp" : : "r"(sp)); \
     } while(0)
 
-int srspawn(void *(*fn)(void *), void *arg) {
+int sherrySpawn(void *(*fn)(void *), void *arg) {
 
-    srRoutine *newr = addRoutine(fn, arg);
+    actor *newr = addActor(fn, arg);
 
     /* interrupt current running routine */
-    srRoutine *curr = S->running;
-    enqueue(&S->readyq, &curr->qnode);
+    actor *curr = S->running;
+    setReady(curr);
 
     if (sigsetjmp(curr->ctx, 0)) {
         /* If the return value of sigsetjmp is greater than zero,
@@ -185,11 +246,11 @@ int srspawn(void *(*fn)(void *), void *arg) {
 
     /* The return value of sigsetjmp is zero means that we continue the
      * current context, spawn the new routine and run it. */
-    S->running = newr;
+    setRunning(newr);
 
     /* switch stack here, then we cannot access fn and arg from stack
      * params, we call it through the global scheduler. */
-    switchsp(getstack(newr));
+    switchsp(actorStack(newr));
     S->running->fn(S->running->arg);
 
     /* the routine ends, release resources and give control back to
@@ -198,38 +259,74 @@ int srspawn(void *(*fn)(void *), void *arg) {
     /* we should not free the memory of current stack, so we switch to
      * the global temp stack first. */
     switchsp(tmpstack);
-    delRoutine(S->running->rid);
+    delActor(S->running->rid);
 
     resume();
 
     return 0; // never reach here
 }
 
-void sryield(void) {
-    srRoutine *curr = S->running;
-    enqueue(&S->readyq, &curr->qnode);
-    if (!sigsetjmp(curr->ctx, 0))
-        resume();
+void sherryYield(void) {
+    setReady(S->running);
+    yield();
 }
 
-void srinit(void) {
-    S = srmalloc(sizeof(srScheduler));
+/* Send a message to the receiver actor. This function never blocks the
+ * running actor. */
+void sherrySendMsg(int dst, int msgtype, void *payload, size_t size) {
+    actor *sender = S->running;
+    actor *receiver = S->actors[dst]; // TODO: check the dst idx
+
+    struct message *msg = srmalloc(sizeof(struct message));
+    msg->senderid = sender->rid;
+    msg->receiverid = receiver->rid;
+    msg->msgtype = msgtype;
+    msg->payload = payload;
+    msg->size = size;
+    msg->node.prev = NULL;
+    msg->node.next = NULL;
+    listEnqueue(&receiver->mailbox, &msg->node);
+
+    if (receiver->status == SHERRY_STATE_WAIT_MSG) {
+        listErase(&S->waitq, &receiver->node);
+        setReady(receiver);
+    }
+}
+
+/* Running actor receives a message from its mailbox. If there is nothing
+ * in the mailbox, the running actor will yield and be invoked again when
+ * there is something in the mailbox. */
+struct message *sherryReceiveMsg(void) {
+    actor *a = S->running;
+    if (listEmpty(&a->mailbox)) {
+        a->status = SHERRY_STATE_WAIT_MSG;
+        listEnqueue(&S->waitq, &a->node);
+        yield();
+    }
+    struct listNode *node = listDequeue(&a->mailbox);
+    struct message *msg = get_cont(node, struct message, node);
+    return msg;
+}
+
+void sherryInit(void) {
+    S = srmalloc(sizeof(scheduler));
 
     const size_t sz = 1000; // initial S->routines size
-    S->sizeroutines = sz;
-    S->routines = srmalloc(sizeof(srRoutine *) * sz);
-    memset(S->routines, 0, sizeof(srRoutine *) * sz);
+    S->sizeactors = sz;
+    S->actors = srmalloc(sizeof(actor *) * sz);
+    memset(S->actors, 0, sizeof(actor *) * sz);
 
     /* set current running to the fake main routine. */
-    S->main = addRoutine(NULL, NULL);
+    S->main = addActor(NULL, NULL);
     S->running = S->main;
 
-    queueInit(&S->readyq);
+    listInit(&S->readyq);
+    listInit(&S->waitq);
 }
 
-void srexit(void) {
-    delRoutine(S->main->rid);
-    srfree(S->routines);
+void sherryExit(void) {
+    delActor(S->main->rid);
+    srfree(S->actors);
     srfree(S);
 }
 
@@ -242,7 +339,7 @@ void *testf(void *arg) {
     struct testArg *targ = (struct testArg *)arg;
     for (int i = 1; i <= targ->cnt; i++) {
         printf("%s: %d\n", targ->name, i);
-        sryield();
+        sherryYield();
     }
     return NULL;
 }
@@ -253,32 +350,57 @@ void testsimple(void) {
     struct testArg arg3 = {"sherry routine 3", 10};
     struct testArg arg4 = {"sherry routine 4", 2};
 
-    srspawn(testf, &arg1);
-    srspawn(testf, &arg2);
-    srspawn(testf, &arg3);
-    srspawn(testf, &arg4);
+    sherrySpawn(testf, &arg1);
+    sherrySpawn(testf, &arg2);
+    sherrySpawn(testf, &arg3);
+    sherrySpawn(testf, &arg4);
 
-    while (!queueEmpty(&S->readyq))
-        sryield();
+    while (!listEmpty(&S->readyq))
+        sherryYield();
+}
+
+#define MSG_PING 100
+
+void *pingf(void *arg) {
+    printf("PING!\n");
+    sherrySendMsg((int)arg, MSG_PING, NULL, 0);
+    return NULL;
+}
+
+void *pongf(void *arg) {
+    struct message *msg = sherryReceiveMsg();
+    if (msg->msgtype == MSG_PING) {
+        printf("PONG!\n");
+    }
+    srfree(msg);
+    return NULL;
+}
+
+void testMessage(void) {
+    int sid = sherrySpawn(pongf, NULL);
+    int rid = sherrySpawn(pingf, (void *)sid);
+    while (!listEmpty(&S->readyq))
+        sherryYield();
 }
 
 void *benchf(void *arg) {
     size_t cnt = (size_t)arg;
     for (size_t i = 0; i < cnt; i++)
-        sryield();
+        sherryYield();
     return NULL;
 }
 
 void benchswitch(void) {
     for (size_t i = 0; i < 10000; i++)
-        srspawn(benchf, (void *)1000);
-    while (!queueEmpty(&S->readyq))
-        sryield();
+        sherrySpawn(benchf, (void *)1000);
+    while (!listEmpty(&S->readyq))
+        sherryYield();
 }
 
 int main(void) {
-    srinit();
+    sherryInit();
     // testsimple();
-    benchswitch();
-    srexit();
+    testMessage();
+    // benchswitch();
+    sherryExit();
 }
