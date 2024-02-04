@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <stddef.h>
 
+#include "sherry.h"
+
 void *srmalloc(size_t sz) {
     void *p = malloc(sz);
     // printf("srmalloc at: %ld\n", p);
@@ -95,12 +97,8 @@ struct listNode *listDequeue(struct list *q) {
     return node;
 }
 
-struct message {
-    int senderid;
-    int receiverid;
-    int msgtype;
-    void *payload;
-    size_t size;
+struct messageNode {
+    struct message msg;
     struct listNode node;
 };
 
@@ -137,6 +135,7 @@ actor *newActor(int rid, void *(*fn)(void *), void *arg) {
     r->arg = arg;
     r->node.prev = NULL;
     r->node.next = NULL;
+    listInit(&r->mailbox);
     return r;
 }
 
@@ -277,12 +276,12 @@ void sherrySendMsg(int dst, int msgtype, void *payload, size_t size) {
     actor *sender = S->running;
     actor *receiver = S->actors[dst]; // TODO: check the dst idx
 
-    struct message *msg = srmalloc(sizeof(struct message));
-    msg->senderid = sender->rid;
-    msg->receiverid = receiver->rid;
-    msg->msgtype = msgtype;
-    msg->payload = payload;
-    msg->size = size;
+    struct messageNode *msg = srmalloc(sizeof(*msg));
+    msg->msg.senderid = sender->rid;
+    msg->msg.receiverid = receiver->rid;
+    msg->msg.msgtype = msgtype;
+    msg->msg.payload = payload;
+    msg->msg.size = size;
     msg->node.prev = NULL;
     msg->node.next = NULL;
     listEnqueue(&receiver->mailbox, &msg->node);
@@ -304,8 +303,8 @@ struct message *sherryReceiveMsg(void) {
         yield();
     }
     struct listNode *node = listDequeue(&a->mailbox);
-    struct message *msg = get_cont(node, struct message, node);
-    return msg;
+    struct messageNode *msg = get_cont(node, struct messageNode, node);
+    return (struct message *)msg;
 }
 
 void sherryInit(void) {
@@ -325,82 +324,11 @@ void sherryInit(void) {
 }
 
 void sherryExit(void) {
+    /* wait all ready actors exit. */
+    while (!listEmpty(&S->readyq))
+        sherryYield();
     delActor(S->main->rid);
     srfree(S->actors);
     srfree(S);
 }
 
-struct testArg {
-    const char *name;
-    int cnt;
-};
-
-void *testf(void *arg) {
-    struct testArg *targ = (struct testArg *)arg;
-    for (int i = 1; i <= targ->cnt; i++) {
-        printf("%s: %d\n", targ->name, i);
-        sherryYield();
-    }
-    return NULL;
-}
-
-void testsimple(void) {
-    struct testArg arg1 = {"sherry routine 1", 5};
-    struct testArg arg2 = {"sherry routine 2", 3};
-    struct testArg arg3 = {"sherry routine 3", 10};
-    struct testArg arg4 = {"sherry routine 4", 2};
-
-    sherrySpawn(testf, &arg1);
-    sherrySpawn(testf, &arg2);
-    sherrySpawn(testf, &arg3);
-    sherrySpawn(testf, &arg4);
-
-    while (!listEmpty(&S->readyq))
-        sherryYield();
-}
-
-#define MSG_PING 100
-
-void *pingf(void *arg) {
-    printf("PING!\n");
-    sherrySendMsg((int)arg, MSG_PING, NULL, 0);
-    return NULL;
-}
-
-void *pongf(void *arg) {
-    struct message *msg = sherryReceiveMsg();
-    if (msg->msgtype == MSG_PING) {
-        printf("PONG!\n");
-    }
-    srfree(msg);
-    return NULL;
-}
-
-void testMessage(void) {
-    int sid = sherrySpawn(pongf, NULL);
-    int rid = sherrySpawn(pingf, (void *)sid);
-    while (!listEmpty(&S->readyq))
-        sherryYield();
-}
-
-void *benchf(void *arg) {
-    size_t cnt = (size_t)arg;
-    for (size_t i = 0; i < cnt; i++)
-        sherryYield();
-    return NULL;
-}
-
-void benchswitch(void) {
-    for (size_t i = 0; i < 10000; i++)
-        sherrySpawn(benchf, (void *)1000);
-    while (!listEmpty(&S->readyq))
-        sherryYield();
-}
-
-int main(void) {
-    sherryInit();
-    // testsimple();
-    testMessage();
-    // benchswitch();
-    sherryExit();
-}
