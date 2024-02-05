@@ -21,9 +21,13 @@ void srfree(void *p) {
     free(p);
 }
 
+/* ============================================================================
+ * Generic double linked list implementation.
+ * Most code from github.com/sustrik/libmill.
+ * ========================================================================== */
+
 /* Takes a pointer to a member variable and computes pointer to the structure
- * that contains it. 'type' is type of the structure, not the member.
- * NOTE: This macro code from github.com/sustrik/libmill. */
+ * that contains it. 'type' is type of the structure, not the member. */
 #define get_cont(ptr, type, member) \
     (ptr ? ((type*) (((char*) ptr) - offsetof(type, member))) : NULL)
 
@@ -52,6 +56,7 @@ void listInit(struct list *l) {
     l->tail = NULL;
 }
 
+/* Insert node 'item' to a list before the 'it' node. */
 void listInsert(struct list *self, struct listNode *item, struct listNode *it) {
     item->prev = it ? it->prev : self->tail;
     item->next = it;
@@ -65,6 +70,8 @@ void listInsert(struct list *self, struct listNode *item, struct listNode *it) {
         self->tail = item;
 }
 
+/* Erase a node from list, the given node must be in the list. Return the
+ * next node pointer. */
 struct listNode *listErase(struct list *self, struct listNode *item) {
     struct listNode *next;
 
@@ -85,10 +92,14 @@ struct listNode *listErase(struct list *self, struct listNode *item) {
     return next;
 }
 
+/* Simple double linked list based queue interface. Insert a node at the
+ * tail of list. */
 void listEnqueue(struct list *q, struct listNode *node) {
     listInsert(q, node, NULL);
 }
 
+/* Simple double linked list based queue interface. Pop up the list's 
+ * head node. */
 struct listNode *listDequeue(struct list *q) {
     struct listNode *node = listBegin(q);
     if (node == NULL)
@@ -97,25 +108,41 @@ struct listNode *listDequeue(struct list *q) {
     return node;
 }
 
+/* ============================================================================
+ * Sherry actor model core implementation.
+ * ========================================================================== */
+
+/* A wrapper for struct message that make it a list node and be possible for 
+ * maintaining in a queue. */
 struct messageNode {
     struct message msg;
     struct listNode node;
 };
 
-typedef jmp_buf srctx;
-
-#define SHERRY_STACK_SIZE 4096
-
-/* all posible actor status */
+/* All posible actor status */
 #define SHERRY_STATE_DEAD       0
 #define SHERRY_STATE_READY      1
 #define SHERRY_STATE_RUNNING    2
 #define SHERRY_STATE_WAIT_MSG   3
 
+typedef jmp_buf context;
+
+#define SHERRY_STACK_SIZE 4096
+
+/* Data structure of a actor. Actually, in memory, there is a stack living
+ * in the lower address area of the actor struct. The memory model likes:
+ *
+ * +---------------------------------------------+------------------+
+ * |                                       stack |     struct actor |
+ * +---------------------------------------------+------------------+
+ *
+ * So the actual memory size of a actor is sizeof(struct actor) plus the
+ * stack size.
+ */
 typedef struct actor {
     int rid;              // routine id
     int status;           // actor current status
-    srctx ctx;            // routine running context
+    context ctx;          // actor running context
     void *(*fn)(void *);  // main function need to run
     void *arg;            // args for main function
     struct list mailbox;  // a queue of received messages in this actor
@@ -124,10 +151,10 @@ typedef struct actor {
 } actor;
 
 actor *newActor(int rid, void *(*fn)(void *), void *arg) {
-    /* p is the end of the routine's stack. */
+    /* p is the original allocated pointer. */
     char *p = srmalloc(sizeof(actor) + SHERRY_STACK_SIZE);
-    /* the start SHERRY_STACK_SIZE bytes are used as the routine's
-     * stack. */
+    /* The first SHERRY_STACK_SIZE bytes are used as the actor's
+     * stack. See the memory model above. */
     actor *r = (actor *)(p + SHERRY_STACK_SIZE);
     r->rid = rid;
     r->status = SHERRY_STATE_READY;
@@ -140,27 +167,26 @@ actor *newActor(int rid, void *(*fn)(void *), void *arg) {
 }
 
 void freeActor(actor *r) {
+    /* Go back to the original allocated pointer. */
     char *p = (char *)r - SHERRY_STACK_SIZE;
     srfree(p);
 }
 
+/* The pointer to the struct actor is also the start address of the stack */
 void *actorStack(actor *r) { return r; }
 
 typedef struct scheduler {
-    int sizeactors;     // the size of array routines
-    actor **actors; // all register routines
-    actor *main;      // the fake main routine
-    actor *running;   // the current running routine
-    struct list readyq; // routines ready to run
-    struct list waitq; // blocked actors
+    int sizeactors;     // the size of array actors
+    actor **actors;     // all register actors, indexed by actor id
+    actor *main;        // the fake main actor
+    actor *running;     // the current running actor
+    struct list readyq; // actors ready to run
+    struct list waitq;  // blocked actors
 } scheduler;
 
 scheduler *S;
 
-char _tmpstack[4096];
-char *tmpstack = _tmpstack + sizeof(_tmpstack);
-
-/* add a new routine to routines array. */
+/* Add a new actor to actors array. */
 actor *addActor(void *(*fn)(void *), void *arg) {
     /* TODO: O(n) now, make it O(1)? */
     int rid = -1;
@@ -185,6 +211,7 @@ actor *addActor(void *(*fn)(void *), void *arg) {
     return rt;
 }
 
+/* Delete an actor from actors array. */
 void delActor(int rid) {
     if (rid < 0 || rid >= S->sizeactors || S->actors[rid] == NULL)
         return;
@@ -207,7 +234,7 @@ void setRunning(actor *a) {
     S->running = a;
 }
 
-/* resume one routine from ready list */
+/* Resume one actor in the ready queue. */
 void resume(void) {
     struct listNode *node = listDequeue(&S->readyq);
     actor *next = get_cont(node, actor, node);
@@ -217,21 +244,29 @@ void resume(void) {
     }
 }
 
+/* Yield current running actor, save the context and go to resume for running
+ * the next one. Note that, this yield function would not do any extra work,
+ * other work like enqueueing to the ready queue or wait queue should be done
+ * before calling this function. */
 void yield(void) {
     actor *a = S->running;
     if (!sigsetjmp(a->ctx, 0))
         resume();
 }
 
+/* Assembly level code to switch current stack. This macro should satisfy any
+ * supported architectures. */
 #define switchsp(sp) do { \
         asm volatile ("movq %0, %%rsp" : : "r"(sp)); \
     } while(0)
 
+/* Spawn a new actor, interrupt the current running actor and give the control
+ * to the new spawned one. */
 int sherrySpawn(void *(*fn)(void *), void *arg) {
 
-    actor *newr = addActor(fn, arg);
+    actor *newactor = addActor(fn, arg);
 
-    /* interrupt current running routine */
+    /* interrupt current running actor */
     actor *curr = S->running;
     setReady(curr);
 
@@ -240,31 +275,36 @@ int sherrySpawn(void *(*fn)(void *), void *arg) {
          * it means that we go back to this saved context
          * by siglongjmp, then we should return and continue
          * the interrupted routine. */
-        return newr->rid;
+        return newactor->rid;
     }
 
     /* The return value of sigsetjmp is zero means that we continue the
-     * current context, spawn the new routine and run it. */
-    setRunning(newr);
+     * current context, spawn the new actor and run it. */
+    setRunning(newactor);
 
-    /* switch stack here, then we cannot access fn and arg from stack
-     * params, we call it through the global scheduler. */
-    switchsp(actorStack(newr));
+    /* Switch stack here, then we cannot access fn and arg from stack params,
+     * so we call it through the global scheduler. */
+    switchsp(actorStack(newactor));
     S->running->fn(S->running->arg);
 
-    /* the routine ends, release resources and give control back to
-     * scheduler. */
+    /* The actor exits, we should release resources and give control back to
+     * scheduler. We should not free the memory of current stack, so we keep
+     * a temp stack as a static variable and switch to it before we do the
+     * cleanup job. */
 
-    /* we should not free the memory of current stack, so we switch to
-     * the global temp stack first. */
+    static char _tmpstack[4096];
+    static char *tmpstack = _tmpstack + sizeof(_tmpstack);
+
     switchsp(tmpstack);
     delActor(S->running->rid);
 
+    /* Give the control back to scheduler. */
     resume();
 
     return 0; // never reach here
 }
 
+/* Put the current running actor to ready queue and yield. */
 void sherryYield(void) {
     setReady(S->running);
     yield();
@@ -286,6 +326,7 @@ void sherrySendMsg(int dst, int msgtype, void *payload, size_t size) {
     msg->node.next = NULL;
     listEnqueue(&receiver->mailbox, &msg->node);
 
+    /* Revoke the receiver actor if it is blocked. */
     if (receiver->status == SHERRY_STATE_WAIT_MSG) {
         listErase(&S->waitq, &receiver->node);
         setReady(receiver);
@@ -310,7 +351,7 @@ struct message *sherryReceiveMsg(void) {
 void sherryInit(void) {
     S = srmalloc(sizeof(scheduler));
 
-    const size_t sz = 1000; // initial S->routines size
+    const size_t sz = 1000; // initial S->actors size
     S->sizeactors = sz;
     S->actors = srmalloc(sizeof(actor *) * sz);
     memset(S->actors, 0, sizeof(actor *) * sz);
