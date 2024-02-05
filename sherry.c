@@ -3,6 +3,9 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "sherry.h"
 
@@ -124,6 +127,8 @@ struct messageNode {
 #define SHERRY_STATE_READY      1
 #define SHERRY_STATE_RUNNING    2
 #define SHERRY_STATE_WAIT_MSG   3
+#define SHERRY_STATE_WAIT_RFD   4 // waiting readable fd
+#define SHERRY_STATE_WAIT_WFD   5 // waiting writable fd
 
 typedef jmp_buf context;
 
@@ -175,13 +180,17 @@ void freeActor(actor *r) {
 /* The pointer to the struct actor is also the start address of the stack */
 void *actorStack(actor *r) { return r; }
 
+#define SHERRY_MAX_FD 1024
+
 typedef struct scheduler {
     int sizeactors;     // the size of array actors
     actor **actors;     // all register actors, indexed by actor id
     actor *main;        // the fake main actor
     actor *running;     // the current running actor
     struct list readyq; // actors ready to run
-    struct list waitq;  // blocked actors
+    struct list waitingmsg; // actors blocked on mailbox
+    struct list *waitwrite; // maps fd to a list of actors blocked on write fd
+    struct list *waitread; // maps fd a list of actors blocked on read fd
 } scheduler;
 
 scheduler *S;
@@ -234,13 +243,52 @@ void setRunning(actor *a) {
     S->running = a;
 }
 
+/* Unblock all actors in the given list. */
+void unblockAllActors(struct list *list) {
+    struct listNode *node;
+    actor *a;
+    while (!listEmpty(list)) {
+        node = listDequeue(list);
+        a = get_cont(node, actor, node);
+        setReady(a);
+    }
+}
+
+void poll(void) {
+    fd_set rfds;
+    fd_set wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+
+    for (int fd = 0; fd < SHERRY_MAX_FD; fd++) {
+        if (!listEmpty(&S->waitwrite[fd])) FD_SET(fd, &wfds);
+        if (!listEmpty(&S->waitread[fd]))  FD_SET(fd, &rfds);
+    }
+
+    int ret = select(SHERRY_MAX_FD + 1, &rfds, &wfds, NULL, NULL);
+    if (ret == -1) {
+        perror("select error()");
+        exit(1);
+    }
+
+    for (int fd = 0; fd < SHERRY_MAX_FD; fd++) {
+        if (FD_ISSET(fd, &rfds))
+            unblockAllActors(&S->waitread[fd]);
+        if (FD_ISSET(fd, &wfds))
+            unblockAllActors(&S->waitwrite[fd]);
+    }
+}
+
 /* Resume one actor in the ready queue. */
 void resume(void) {
-    struct listNode *node = listDequeue(&S->readyq);
-    actor *next = get_cont(node, actor, node);
-    if (next != NULL) {
-        setRunning(next);
-        siglongjmp(next->ctx, 1);
+    while (1) {
+        struct listNode *node = listDequeue(&S->readyq);
+        actor *next = get_cont(node, actor, node);
+        if (next != NULL) {
+            setRunning(next);
+            siglongjmp(next->ctx, 1);
+        }
+        poll();
     }
 }
 
@@ -328,7 +376,7 @@ void sherrySendMsg(int dst, int msgtype, void *payload, size_t size) {
 
     /* Revoke the receiver actor if it is blocked. */
     if (receiver->status == SHERRY_STATE_WAIT_MSG) {
-        listErase(&S->waitq, &receiver->node);
+        listErase(&S->waitingmsg, &receiver->node);
         setReady(receiver);
     }
 }
@@ -340,13 +388,30 @@ struct message *sherryReceiveMsg(void) {
     actor *a = S->running;
     if (listEmpty(&a->mailbox)) {
         a->status = SHERRY_STATE_WAIT_MSG;
-        listEnqueue(&S->waitq, &a->node);
+        listEnqueue(&S->waitingmsg, &a->node);
         yield();
     }
     struct listNode *node = listDequeue(&a->mailbox);
     struct messageNode *msg = get_cont(node, struct messageNode, node);
     return (struct message *)msg;
 }
+
+#define SE_READABLE 1
+#define SE_WRITABLE 2
+
+/* Wait until the given file descriptor is ready. */
+void waitFile(int fd, int event) {
+    actor *a = S->running;
+    if (event == SE_READABLE)
+        listEnqueue(&S->waitread[fd], &a->node);
+    if (event == SE_WRITABLE)
+        listEnqueue(&S->waitwrite[fd], &a->node);
+    yield();
+}
+
+int sherryAccept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+ssize_t sherryRead(int fd, void *buf, size_t count);
+ssize_t sherryWrite(int fd, const void *buf, size_t count);
 
 void sherryInit(void) {
     S = srmalloc(sizeof(scheduler));
@@ -361,7 +426,14 @@ void sherryInit(void) {
     S->running = S->main;
 
     listInit(&S->readyq);
-    listInit(&S->waitq);
+    listInit(&S->waitingmsg);
+
+    S->waitwrite = srmalloc(sizeof(*S->waitwrite) * SHERRY_MAX_FD);
+    S->waitread  = srmalloc(sizeof(*S->waitread)  * SHERRY_MAX_FD);
+    for (int i = 0; i < SHERRY_MAX_FD; i++) {
+        listInit(&S->waitwrite[i]);
+        listInit(&S->waitread[i]);
+    }
 }
 
 void sherryExit(void) {
