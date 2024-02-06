@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <errno.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -254,7 +255,7 @@ void unblockAllActors(struct list *list) {
     }
 }
 
-void poll(void) {
+void pollFile(void) {
     fd_set rfds;
     fd_set wfds;
     FD_ZERO(&rfds);
@@ -288,7 +289,7 @@ void resume(void) {
             setRunning(next);
             siglongjmp(next->ctx, 1);
         }
-        poll();
+        pollFile();
     }
 }
 
@@ -409,9 +410,36 @@ void waitFile(int fd, int event) {
     yield();
 }
 
-int sherryAccept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
-ssize_t sherryRead(int fd, void *buf, size_t count);
-ssize_t sherryWrite(int fd, const void *buf, size_t count);
+int sherryAccept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    int s;
+    while (1) {
+        s = accept(sockfd, addr, addrlen);
+        if (s >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            return s;
+        /* We get EAGAIN or EWOULDBLOCK, block. */
+        waitFile(sockfd, SE_READABLE);
+    }
+}
+
+ssize_t sherryRead(int fd, void *buf, size_t count) {
+    int nread;
+    while (1) {
+        nread = read(fd, buf, count);
+        if (nread >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            return nread;
+        waitFile(fd, SE_READABLE);
+    }
+}
+
+ssize_t sherryWrite(int fd, const void *buf, size_t count) {
+    int nwrite;
+    while (1) {
+        nwrite = write(fd, buf, count);
+        if (nwrite >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            return nwrite;
+        waitFile(fd, SE_READABLE);
+    }
+}
 
 void sherryInit(void) {
     S = srmalloc(sizeof(scheduler));
