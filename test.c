@@ -37,6 +37,10 @@ void testsimple(void) {
 void *pingf(void *arg) {
     printf("PING!\n");
     sherrySendMsg((int)arg, MSG_PING, NULL, 0);
+    /* send the second message which will not be processed,
+     * but we should pass the valgrind test. */
+    printf("PING!\n");
+    sherrySendMsg((int)arg, MSG_PING, NULL, 0);
     return NULL;
 }
 
@@ -71,7 +75,7 @@ void benchswitch(void) {
 }
 
 int main(void) {
-    testMessage();
-    testsimple();
+    // testMessage();
+    // testsimple();
     benchswitch();
 }

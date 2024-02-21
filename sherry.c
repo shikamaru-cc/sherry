@@ -173,6 +173,12 @@ actor *newActor(int rid, void *(*fn)(void *), void *arg) {
 }
 
 void freeActor(actor *r) {
+    while (!listEmpty(&r->mailbox)) {
+        struct listNode *node = listDequeue(&r->mailbox);
+        struct messageNode *msg = get_cont(node, struct messageNode, node);
+        srfree(msg->msg.payload);
+        srfree(msg);
+    }
     /* Go back to the original allocated pointer. */
     char *p = (char *)r - SHERRY_STACK_SIZE;
     srfree(p);
@@ -470,6 +476,8 @@ void sherryExit(void) {
         sherryYield();
     delActor(S->main->rid);
     srfree(S->actors);
+    srfree(S->waitwrite);
+    srfree(S->waitread);
     srfree(S);
 }
 
