@@ -14,24 +14,24 @@ void testf(int argc, char **argv) {
     int cnt = atoi(argv[1]);
     for (int i = 1; i <= cnt; i++) {
         printf("actor %s: %d\n", argv[0], i);
-        sherryYield();
+        sherry_yield();
     }
 }
 
-void testsimple(void) {
-    sherryInit();
+void test_simple(void) {
+    sherry_init();
 
     char *arg1[] = {"sherry routine 1", "5"};
     char *arg2[] = {"sherry routine 2", "3"};
     char *arg3[] = {"sherry routine 3", "10"};
     char *arg4[] = {"sherry routine 4", "2"};
 
-    sherrySpawn(testf, 2, arg1);
-    sherrySpawn(testf, 2, arg2);
-    sherrySpawn(testf, 2, arg3);
-    sherrySpawn(testf, 2, arg4);
+    sherry_spawn(testf, 2, arg1);
+    sherry_spawn(testf, 2, arg2);
+    sherry_spawn(testf, 2, arg3);
+    sherry_spawn(testf, 2, arg4);
 
-    sherryExit();
+    sherry_exit();
 }
 
 #define MSG_PING 100
@@ -40,54 +40,54 @@ void pingf(int argc, char **argv) {
     assert(argc == 1);
     int dst = atoi(argv[0]);
     printf("PING!\n");
-    sherrySendMsg(dst, MSG_PING, NULL);
+    sherry_msg_send(dst, MSG_PING, NULL);
     /* send the second message which will not be processed,
      * but we should pass the valgrind test. */
     printf("PING!\n");
-    sherrySendMsg(dst, MSG_PING, NULL);
+    sherry_msg_send(dst, MSG_PING, NULL);
 }
 
 void pongf(int argc, char **argv) {
     SHERRY_NOTUSED(argv);
     assert(argc == 0);
-    struct message *msg = sherryReceiveMsg();
+    struct sherry_msg *msg = sherry_msg_recv();
     if (msg->msgtype == MSG_PING) {
         printf("PONG!\n");
     }
     free(msg);
 }
 
-void testMessage(void) {
-    sherryInit();
+void test_message(void) {
+    sherry_init();
 
     char str[10];
 
-    int sid = sherrySpawn(pongf, 0, NULL);
+    int sid = sherry_spawn(pongf, 0, NULL);
 
     snprintf(str, sizeof(str), "%d", sid);
     char *pingargs[] = {str};
-    sherrySpawn(pingf, 1, pingargs);
+    sherry_spawn(pingf, 1, pingargs);
 
-    sherryExit();
+    sherry_exit();
 }
 
 void benchf(int argc, char **argv) {
     assert(argc == 1);
     int cnt = atoi(argv[0]);
     for (int i = 0; i < cnt; i++)
-        sherryYield();
+        sherry_yield();
 }
 
-void benchswitch(void) {
-    sherryInit();
+void bench_switch(void) {
+    sherry_init();
     char *argv[] = {"1000"};
     for (size_t i = 0; i < 10000; i++)
-        sherrySpawn(benchf, 1, argv);
-    sherryExit();
+        sherry_spawn(benchf, 1, argv);
+    sherry_exit();
 }
 
 int main(void) {
-    testMessage();
-    testsimple();
-    benchswitch();
+    test_message();
+    test_simple();
+    bench_switch();
 }
