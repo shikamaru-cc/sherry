@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "sherry.h"
+#include "sds.h"
 
 void *srmalloc(size_t sz) {
     void *p = malloc(sz);
@@ -134,6 +135,7 @@ struct messageNode {
 typedef jmp_buf context;
 
 #define SHERRY_STACK_SIZE 4096
+#define SHERRY_MAX_ARGC   20   // maximum arg number for spawning actor
 
 /* Data structure of a actor. Actually, in memory, there is a stack living
  * in the lower address area of the actor struct. The memory model likes:
@@ -146,17 +148,18 @@ typedef jmp_buf context;
  * stack size.
  */
 typedef struct actor {
-    int rid;              // routine id
-    int status;           // actor current status
-    context ctx;          // actor running context
-    void *(*fn)(void *);  // main function need to run
-    void *arg;            // args for main function
-    struct list mailbox;  // a queue of received messages in this actor
-    struct listNode node; // actor is a doule-linked list based
-                          // queue in the scheduler now.
+    int rid;                    // routine id
+    int status;                 // actor current status
+    context ctx;                // actor running context
+    sherry_fn_t fn;             // actor function
+    int argc;                   // number of arguments
+    sds argv[SHERRY_MAX_ARGC];  // actor arguments
+    struct list mailbox;        // a queue of received messages in this actor
+    struct listNode node;       // actor is a doule-linked list based
+                                // queue in the scheduler now.
 } actor;
 
-actor *newActor(int rid, void *(*fn)(void *), void *arg) {
+actor *newActor(int rid, sherry_fn_t fn, int argc, char **argv) {
     /* p is the original allocated pointer. */
     char *p = srmalloc(sizeof(actor) + SHERRY_STACK_SIZE);
     /* The first SHERRY_STACK_SIZE bytes are used as the actor's
@@ -164,8 +167,15 @@ actor *newActor(int rid, void *(*fn)(void *), void *arg) {
     actor *r = (actor *)(p + SHERRY_STACK_SIZE);
     r->rid = rid;
     r->status = SHERRY_STATE_READY;
+
     r->fn = fn;
-    r->arg = arg;
+    r->argc = argc;
+    /* TODO: error on argc over max */
+    if (argc > 0) {
+        for (int i = 0; i < r->argc; i++)
+            r->argv[i] = sdsnew(argv[i]);
+    }
+
     r->node.prev = NULL;
     r->node.next = NULL;
     listInit(&r->mailbox);
@@ -173,12 +183,18 @@ actor *newActor(int rid, void *(*fn)(void *), void *arg) {
 }
 
 void freeActor(actor *r) {
+    /* release resources */
+
+    for (int i = 0; i < r->argc; i++)
+        sdsfree(r->argv[i]);
+
     while (!listEmpty(&r->mailbox)) {
         struct listNode *node = listDequeue(&r->mailbox);
         struct messageNode *msg = get_cont(node, struct messageNode, node);
-        srfree(msg->msg.payload);
+        sdsfree(msg->msg.payload);
         srfree(msg);
     }
+
     /* Go back to the original allocated pointer. */
     char *p = (char *)r - SHERRY_STACK_SIZE;
     srfree(p);
@@ -197,13 +213,13 @@ typedef struct scheduler {
     struct list readyq; // actors ready to run
     struct list waitingmsg; // actors blocked on mailbox
     struct list *waitwrite; // maps fd to a list of actors blocked on write fd
-    struct list *waitread; // maps fd a list of actors blocked on read fd
+    struct list *waitread;  // maps fd a list of actors blocked on read fd
 } scheduler;
 
 scheduler *S;
 
 /* Add a new actor to actors array. */
-actor *addActor(void *(*fn)(void *), void *arg) {
+actor *addActor(sherry_fn_t fn, int argc, char **argv) {
     /* TODO: O(n) now, make it O(1)? */
     int rid = -1;
     for (int i = 0; i < S->sizeactors; i++) {
@@ -212,6 +228,7 @@ actor *addActor(void *(*fn)(void *), void *arg) {
             break;
         }
     }
+
     /* there is no available slot, realloc routines array. */
     if (rid == -1) {
         size_t oldsize = S->sizeactors;
@@ -222,7 +239,8 @@ actor *addActor(void *(*fn)(void *), void *arg) {
         S->sizeactors = newsize;
         rid = oldsize;
     }
-    actor *rt = newActor(rid, fn, arg);
+
+    actor *rt = newActor(rid, fn, argc, argv);
     S->actors[rid] = rt;
     return rt;
 }
@@ -317,9 +335,9 @@ void yield(void) {
 
 /* Spawn a new actor, interrupt the current running actor and give the control
  * to the new spawned one. */
-int sherrySpawn(void *(*fn)(void *), void *arg) {
+int sherrySpawn(sherry_fn_t fn, int argc, char **argv) {
 
-    actor *newactor = addActor(fn, arg);
+    actor *newactor = addActor(fn, argc, argv);
 
     /* interrupt current running actor */
     actor *curr = S->running;
@@ -340,7 +358,7 @@ int sherrySpawn(void *(*fn)(void *), void *arg) {
     /* Switch stack here, then we cannot access fn and arg from stack params,
      * so we call it through the global scheduler. */
     switchsp(actorStack(newactor));
-    S->running->fn(S->running->arg);
+    S->running->fn(S->running->argc, S->running->argv);
 
     /* The actor exits, we should release resources and give control back to
      * scheduler. We should not free the memory of current stack, so we keep
@@ -367,16 +385,18 @@ void sherryYield(void) {
 
 /* Send a message to the receiver actor. This function never blocks the
  * running actor. */
-void sherrySendMsg(int dst, int msgtype, void *payload, size_t size) {
+void sherrySendMsg(int dst, int msgtype, sds payload) {
     actor *sender = S->running;
     actor *receiver = S->actors[dst]; // TODO: check the dst idx
 
     struct messageNode *msg = srmalloc(sizeof(*msg));
-    msg->msg.senderid = sender->rid;
-    msg->msg.receiverid = receiver->rid;
+
+    msg->msg.sender = sender->rid;
+    msg->msg.recver = receiver->rid;
+
     msg->msg.msgtype = msgtype;
     msg->msg.payload = payload;
-    msg->msg.size = size;
+
     msg->node.prev = NULL;
     msg->node.next = NULL;
     listEnqueue(&receiver->mailbox, &msg->node);
@@ -456,7 +476,7 @@ void sherryInit(void) {
     memset(S->actors, 0, sizeof(actor *) * sz);
 
     /* set current running to the fake main routine. */
-    S->main = addActor(NULL, NULL);
+    S->main = addActor(NULL, 0, NULL);
     S->running = S->main;
 
     listInit(&S->readyq);

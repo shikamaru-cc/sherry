@@ -1,14 +1,13 @@
-# CFLAGS=-O2 -Wall -W
-CFLAGS=-O0 -g -Wall -W
+CFLAGS=-O2 -g -Wall -W
+# CFLAGS=-O0 -g -Wall -W
 
-all: test sherry-chat
+TARGETS=examples/test
+DEPS=sherry.c sherry.h sds.c sds.h sdsalloc.h
 
-test: test.c sherry.c
-	$(CC) -o test test.c sherry.c $(CFLAGS)
+all: $(TARGETS)
 
-sherry-chat: sherry.c sherry-chat.c
-	$(CC) -o sherry-chat sherry-chat.c sherry.c $(CFLAGS)
+$(TARGETS): %: %.c $(DEPS)
+	$(CC) $(CFLAGS) $^ -o $@
 
 clean:
-	rm -f test
-	rm -f sherry-chat
+	rm -f $(TARGETS)
