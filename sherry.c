@@ -1,3 +1,5 @@
+#include <assert.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
@@ -7,6 +9,8 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <uv.h>
 
 #include "sherry.h"
 #include "sds.h"
@@ -118,6 +122,9 @@ struct list_node *list_dequeue(struct list *q) {
  * Sherry actor model core implementation.
  * ========================================================================== */
 
+/* Errors should be defined here. */
+#define SHERRY_ERR_INVALID 1
+
 /* A wrapper for struct message that make it a list node and be possible for 
  * maintaining in a queue. */
 struct msg_node {
@@ -137,6 +144,9 @@ void sherry_msg_free(struct sherry_msg *msg) {
 #define SHERRY_STATE_WAIT_MSG   3
 #define SHERRY_STATE_WAIT_RFD   4 // waiting readable fd
 #define SHERRY_STATE_WAIT_WFD   5 // waiting writable fd
+#define SHERRY_STATE_WAIT_EV    6
+
+#define STATE_EV_ACCEPT 10
 
 typedef jmp_buf context;
 
@@ -218,8 +228,7 @@ typedef struct scheduler {
     actor_t *running;     // the current running actor
     struct list readyq; // actors ready to run
     struct list waitingmsg; // actors blocked on mailbox
-    struct list *waitwrite; // maps fd to a list of actors blocked on write fd
-    struct list *waitread;  // maps fd a list of actors blocked on read fd
+    uv_loop_t loop;
 } scheduler_t;
 
 scheduler_t *sche;
@@ -263,10 +272,19 @@ void unreg_actor(int rid) {
     /* TODO: shrink the array size. */
 }
 
+actor_t *current_actor(void) { return sche->running; }
+
+actor_t *get_actor(int aid) {
+    return (aid < sche->sizeactors) ? sche->actors[aid] : NULL;
+}
+
 /* set the actor to running state and enqueue it to readyq. */
 void setready(actor_t *a) {
-    a->status = SHERRY_STATE_READY;
-    list_enqueue(&sche->readyq, &a->node);
+    if (a->status != SHERRY_STATE_READY) {
+        a->status = SHERRY_STATE_READY;
+        list_enqueue(&sche->readyq, &a->node);
+    }
+    /* Already ready, skip. */
 }
 
 void setrunning(actor_t *a) {
@@ -285,31 +303,6 @@ void unblock_all(struct list *list) {
     }
 }
 
-void poll_file(void) {
-    fd_set rfds;
-    fd_set wfds;
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-
-    for (int fd = 0; fd < SHERRY_MAX_FD; fd++) {
-        if (!list_empty(&sche->waitwrite[fd])) FD_SET(fd, &wfds);
-        if (!list_empty(&sche->waitread[fd]))  FD_SET(fd, &rfds);
-    }
-
-    int ret = select(SHERRY_MAX_FD + 1, &rfds, &wfds, NULL, NULL);
-    if (ret == -1) {
-        perror("select error()");
-        exit(1);
-    }
-
-    for (int fd = 0; fd < SHERRY_MAX_FD; fd++) {
-        if (FD_ISSET(fd, &rfds))
-            unblock_all(&sche->waitread[fd]);
-        if (FD_ISSET(fd, &wfds))
-            unblock_all(&sche->waitwrite[fd]);
-    }
-}
-
 /* Resume one actor in the ready queue. */
 void resume(void) {
     while (1) {
@@ -319,7 +312,7 @@ void resume(void) {
             setrunning(next);
             siglongjmp(next->ctx, 1);
         }
-        poll_file();
+        uv_run(&sche->loop, UV_RUN_ONCE);
     }
 }
 
@@ -432,48 +425,189 @@ struct sherry_msg *sherry_msg_recv(void) {
     return (struct sherry_msg *)msg;
 }
 
-#define SE_READABLE 1
-#define SE_WRITABLE 2
+/* ============================================================================
+ * Sherry nonblock network stuff.
+ * ========================================================================== */
+
+#define SHERRY_FD_TCP 1
+
+#define SHERRY_EV_READ  0
+#define SHERRY_EV_WRITE 1
+#define SHERRY_EV_MAX   2
+
+typedef struct sherry_fd {
+    union { uv_tcp_t to_tcp; } handle;
+    int type;
+    const uv_buf_t *rbuf; // read buffer
+    size_t roffset; // read buffer offset
+    int rerror; // read error
+    struct list waitq[SHERRY_EV_MAX]; // blocked actors waiting for
+                                      // different events
+} sherry_fd_t;
+
+sherry_fd_t *fdnew(int type) {
+    sherry_fd_t *fd = srmalloc(sizeof(*fd));
+    if (fd == NULL)
+        return NULL;
+
+    fd->type = type;
+
+    fd->rbuf = NULL;
+    fd->roffset = 0;
+    fd->rerror = 0;
+
+    for (int i = 0; i < SHERRY_EV_MAX; i++)
+        list_init(&fd->waitq[i]);
+
+    return fd;
+}
+
+void fdfree(sherry_fd_t *fd) {
+    srfree(fd);
+}
+
+void close_cb(uv_handle_t *handle) {
+    // fdfree((sherry_fd_t *)handle);
+    SHERRY_NOTUSED(handle);
+}
+
+int sherry_fd_close(sherry_fd_t *fd) {
+    uv_close((uv_handle_t *)&fd->handle, close_cb);
+    fdfree(fd);
+    return 0;
+}
 
 /* Wait until the given file descriptor is ready. */
-void wait_file(int fd, int event) {
-    actor_t *a = sche->running;
-    if (event == SE_READABLE)
-        list_enqueue(&sche->waitread[fd], &a->node);
-    if (event == SE_WRITABLE)
-        list_enqueue(&sche->waitwrite[fd], &a->node);
+void block_fd(sherry_fd_t *fd, int event) {
+    actor_t *actor = current_actor();
+    actor->status = SHERRY_STATE_WAIT_EV;
+    list_enqueue(&fd->waitq[event], &actor->node);
     yield();
 }
 
-int sherry_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-    int s;
+sherry_fd_t *sherry_fd_tcp(void) {
+    sherry_fd_t *fd;
+
+    fd = fdnew(SHERRY_FD_TCP);
+    if (fd == NULL)
+        return NULL;
+
+    /* setup libuv tcp handle */
+    uv_tcp_t *handle = &fd->handle.to_tcp;
+    uv_tcp_init(&sche->loop, handle);
+
+    return fd;
+}
+
+int sherry_tcp_bind(sherry_fd_t *fd, const char *ip, int port) {
+    struct sockaddr_in addr;
+    uv_ip4_addr(ip, port, &addr);
+    return uv_tcp_bind(&fd->handle.to_tcp, (const struct sockaddr *)&addr, 0);
+}
+
+int sherry_tcp_peername(sherry_fd_t *fd, struct sockaddr *name, int *namelen) {
+    return uv_tcp_getpeername(&fd->handle.to_tcp, name, namelen);
+}
+
+void listen_cb(uv_stream_t *server, int status) {
+    if (status < 0) {
+        // TODO: handle error
+    }
+    sherry_fd_t *fd = (sherry_fd_t *)server;
+    unblock_all(&fd->waitq[SHERRY_EV_READ]);
+}
+
+int sherry_listen(sherry_fd_t *fd, int backlog) {
+    if (fd == NULL || fd->type != SHERRY_FD_TCP)
+        return SHERRY_ERR_INVALID;
+    return uv_listen((uv_stream_t *)fd, backlog, listen_cb);
+}
+
+int sherry_accept(sherry_fd_t *serverfd, sherry_fd_t *clientfd) {
     while (1) {
-        s = accept(sockfd, addr, addrlen);
-        if (s >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
-            return s;
-        /* We get EAGAIN or EWOULDBLOCK, block. */
-        wait_file(sockfd, SE_READABLE);
+        int err = uv_accept((uv_stream_t *)serverfd, (uv_stream_t *)clientfd);
+        if (err >= 0 || err != UV_EAGAIN)
+            return err;
+        else /* we got UV_EAGAIN */
+            block_fd(serverfd, SHERRY_EV_READ);
     }
 }
 
-ssize_t sherry_read(int fd, void *buf, size_t count) {
-    int nread;
+void rbuf_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+    SHERRY_NOTUSED(handle);
+    buf->base = srmalloc(suggested_size);
+    buf->len = suggested_size;
+}
+
+void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    sherry_fd_t *fd = (sherry_fd_t *)stream;
+
+    /* When we reach this callback, the old buffer should not be used
+     * anymore, reset it. */
+    if (fd->rbuf) {
+        srfree((void *)fd->rbuf);
+        fd->rbuf = NULL;
+        fd->roffset = 0;
+    }
+
+    /* From libuv document, nread < 0 when error, nread == 0 when nothing
+     * read but everything ok. It's ok to set rerror to nread. */
+    if (nread <= 0) {
+        fd->rerror = nread;
+        return;
+    }
+
+    /* We get a new buffer, set it and unblock all waiting actors. */
+    fd->rbuf = buf;
+    unblock_all(&fd->waitq[SHERRY_EV_READ]);
+}
+
+ssize_t sherry_read(sherry_fd_t *fd, void *buf, size_t count) {
+    /* uv_read_start is re-entryable, just make sure it starts. */
+    int err = uv_read_start((uv_stream_t *)&fd->handle, rbuf_alloc, read_cb);
+    if (err)
+        return err;
+
     while (1) {
-        nread = read(fd, buf, count);
-        if (nread >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        if (fd->rerror)
+            return (fd->rerror == UV_EOF) ? 0 : fd->rerror;
+
+        /* Buffer not empty, we only read from buffer. Now, If the remaining
+         * size is less than count, we simply read all remaining bytes. */
+        if (fd->rbuf && fd->rbuf->len > fd->roffset) {
+            size_t remain = fd->rbuf->len - fd->roffset;
+            size_t nread  = (remain > count) ? count : remain;
+            memcpy(buf, fd->rbuf + fd->roffset, nread);
+            fd->roffset += nread;
             return nread;
-        wait_file(fd, SE_READABLE);
+        }
+
+        /* Nothing in buffer, block */
+        block_fd(fd, SHERRY_EV_READ);
     }
 }
 
-ssize_t sherry_write(int fd, const void *buf, size_t count) {
-    int nwrite;
-    while (1) {
-        nwrite = write(fd, buf, count);
-        if (nwrite >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
-            return nwrite;
-        wait_file(fd, SE_READABLE);
-    }
+void write_cb(uv_write_t *req, int status) {
+    actor_t *actor = (actor_t *)req->data;
+    setready(actor);
+    // TODO: handle status error
+    assert(status == 0);
+}
+
+ssize_t sherry_write(sherry_fd_t *fd, const void *buf, size_t count) {
+    uv_write_t req;
+    req.data = current_actor();
+
+    uv_buf_t uvbuf;
+    uvbuf.base = (char *)buf;
+    uvbuf.len = count;
+
+    uv_write(&req, (uv_stream_t *)&fd->handle, &uvbuf, 1, write_cb);
+    current_actor()->status = SHERRY_STATE_WAIT_EV;
+    yield();
+
+    // TODO: handle error
+    return count;
 }
 
 void sherry_init(void) {
@@ -486,17 +620,12 @@ void sherry_init(void) {
 
     /* set current running to the fake main routine. */
     sche->main = reg_actor(NULL, 0, NULL);
-    sche->running = sche->main;
+    setrunning(sche->main);
 
     list_init(&sche->readyq);
     list_init(&sche->waitingmsg);
 
-    sche->waitwrite = srmalloc(sizeof(*sche->waitwrite) * SHERRY_MAX_FD);
-    sche->waitread  = srmalloc(sizeof(*sche->waitread)  * SHERRY_MAX_FD);
-    for (int i = 0; i < SHERRY_MAX_FD; i++) {
-        list_init(&sche->waitwrite[i]);
-        list_init(&sche->waitread[i]);
-    }
+    uv_loop_init(&sche->loop);
 }
 
 void sherry_exit(void) {
@@ -505,8 +634,7 @@ void sherry_exit(void) {
         sherry_yield();
     unreg_actor(sche->main->aid);
     srfree(sche->actors);
-    srfree(sche->waitwrite);
-    srfree(sche->waitread);
+    uv_loop_close(&sche->loop);
     srfree(sche);
 }
 
