@@ -150,7 +150,7 @@ void sherry_msg_free(struct sherry_msg *msg) {
 
 typedef jmp_buf context;
 
-#define SHERRY_STACK_SIZE 4096
+#define SHERRY_STACK_SIZE (3 * 4096)
 #define SHERRY_MAX_ARGC   20   // maximum arg number for spawning actor
 
 /* Data structure of a actor. Actually, in memory, there is a stack living
@@ -328,9 +328,37 @@ void yield(void) {
 
 /* Assembly level code to switch current stack. This macro should satisfy any
  * supported architectures. */
-#define switchsp(sp) do { \
-        asm volatile ("movq %0, %%rsp" : : "r"(sp)); \
-    } while(0)
+
+#if defined(__x86_64__)
+#define switchsp(sp) do {asm volatile ("movq %0, %%rsp" : : "r"(sp));} while(0)
+#endif
+
+#if defined(__aarch64__)
+#define switchsp(sp) do {asm volatile ("mov sp, %0" : : "r"(sp));} while(0)
+#endif
+
+void start_running(void) {
+    sche->running->fn(sche->running->argc, sche->running->argv);
+}
+
+void finish_running(void) {
+    /* The actor exits, we should release resources and give control back to
+     * scheduler. We should not free the memory of current stack, so we keep
+     * a temp stack as a static variable and switch to it before we do the
+     * cleanup job. */
+
+    const size_t sz = SHERRY_STACK_SIZE;
+    static char *tmpstack = NULL;
+
+    if (tmpstack == NULL) tmpstack = srmalloc(sz) + sz;
+
+    switchsp(tmpstack);
+
+    unreg_actor(sche->running->aid);
+
+    /* Give the control back to scheduler. */
+    resume();
+}
 
 /* Spawn a new actor, interrupt the current running actor and give the control
  * to the new spawned one. */
@@ -354,24 +382,11 @@ int sherry_spawn(sherry_fn_t fn, int argc, char **argv) {
      * current context, spawn the new actor and run it. */
     setrunning(newactor);
 
-    /* Switch stack here, then we cannot access fn and arg from stack params,
-     * so we call it through the global scheduler. */
     switchsp(actor_stack(newactor));
-    sche->running->fn(sche->running->argc, sche->running->argv);
 
-    /* The actor exits, we should release resources and give control back to
-     * scheduler. We should not free the memory of current stack, so we keep
-     * a temp stack as a static variable and switch to it before we do the
-     * cleanup job. */
+    start_running();
 
-    static char _tmpstack[4096];
-    static char *tmpstack = _tmpstack + sizeof(_tmpstack);
-
-    switchsp(tmpstack);
-    unreg_actor(sche->running->aid);
-
-    /* Give the control back to scheduler. */
-    resume();
+    finish_running();
 
     return 0; // never reach here
 }
@@ -467,13 +482,11 @@ void fdfree(sherry_fd_t *fd) {
 }
 
 void close_cb(uv_handle_t *handle) {
-    // fdfree((sherry_fd_t *)handle);
-    SHERRY_NOTUSED(handle);
+    fdfree((sherry_fd_t *)handle);
 }
 
 int sherry_fd_close(sherry_fd_t *fd) {
-    uv_close((uv_handle_t *)&fd->handle, close_cb);
-    fdfree(fd);
+    uv_close((uv_handle_t *)&fd->handle, NULL);
     return 0;
 }
 
@@ -542,6 +555,13 @@ void rbuf_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     sherry_fd_t *fd = (sherry_fd_t *)stream;
 
+    /* From libuv document, nread < 0 when error, nread == 0 when nothing
+     * read but everything ok. It's ok to set rerror to nread. */
+    if (nread <= 0) {
+        fd->rerror = nread;
+        return;
+    }
+
     /* When we reach this callback, the old buffer should not be used
      * anymore, reset it. */
     if (fd->rbuf) {
@@ -550,15 +570,9 @@ void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
         fd->roffset = 0;
     }
 
-    /* From libuv document, nread < 0 when error, nread == 0 when nothing
-     * read but everything ok. It's ok to set rerror to nread. */
-    if (nread <= 0) {
-        fd->rerror = nread;
-        return;
-    }
-
     /* We get a new buffer, set it and unblock all waiting actors. */
     fd->rbuf = buf;
+
     unblock_all(&fd->waitq[SHERRY_EV_READ]);
 }
 

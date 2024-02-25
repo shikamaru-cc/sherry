@@ -1,14 +1,16 @@
-# CFLAGS=-O2 -g -Wall -W
-CFLAGS=-O0 -g -Wall -W
-LIBS=-luv
+# CFLAGS=-O3 -Wall -W
+CFLAGS=-O2 -g -Wall -W -Ilibuv/include
+
+LIBS=libuv/.libs/libuv.a
 
 TARGETS=examples/test examples/http-server
-DEPS=sherry.c sherry.h sds.c sds.h sdsalloc.h
+
+DEPS=sherry.c sds.c
 
 all: $(TARGETS)
 
 $(TARGETS): %: %.c $(DEPS)
-	$(CC) $(CFLAGS) $(LIBS) $^ -o $@
+	$(CC) -o $@ $^ $(LIBS) $(CFLAGS)
 
 clean:
 	rm -f $(TARGETS)
