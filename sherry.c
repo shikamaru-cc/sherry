@@ -10,6 +10,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <valgrind/valgrind.h>
+
 #include <uv.h>
 
 #include "sherry.h"
@@ -150,7 +152,7 @@ void sherry_msg_free(struct sherry_msg *msg) {
 
 typedef jmp_buf context;
 
-#define SHERRY_STACK_SIZE (3 * 4096)
+#define SHERRY_STACK_SIZE (10 * 4096)
 #define SHERRY_MAX_ARGC   20   // maximum arg number for spawning actor
 
 /* Data structure of a actor. Actually, in memory, there is a stack living
@@ -168,16 +170,17 @@ typedef struct actor {
     int status;                // actor current status
     context ctx;               // actor running context
     sherry_fn_t fn;            // actor function
-    int argc;                  // number of arguments
-    sds argv[SHERRY_MAX_ARGC]; // actor arguments
+    void *argv;                // actor argument
+    int valgrind_stk_id;
     struct list mailbox;       // a queue of received messages in this actor
     struct list_node node;     // actor is a doule-linked list based
                                // queue in the scheduler now.
 } actor_t;
 
-actor_t *new_actor(int rid, sherry_fn_t fn, int argc, char **argv) {
+actor_t *new_actor(int rid, sherry_fn_t fn, void *argv) {
     /* p is the original allocated pointer. */
     char *p = srmalloc(sizeof(actor_t) + SHERRY_STACK_SIZE);
+
     /* The first SHERRY_STACK_SIZE bytes are used as the actor's
      * stack. See the memory model above. */
     actor_t *r = (actor_t *)(p + SHERRY_STACK_SIZE);
@@ -185,24 +188,19 @@ actor_t *new_actor(int rid, sherry_fn_t fn, int argc, char **argv) {
     r->status = SHERRY_STATE_READY;
 
     r->fn = fn;
-    r->argc = argc;
-    /* TODO: error on argc over max */
-    if (argc > 0) {
-        for (int i = 0; i < r->argc; i++)
-            r->argv[i] = sdsnew(argv[i]);
-    }
+    r->argv = argv;
+
+    r->valgrind_stk_id = VALGRIND_STACK_REGISTER(p, r);
 
     r->node.prev = NULL;
     r->node.next = NULL;
     list_init(&r->mailbox);
+
     return r;
 }
 
 void free_actor(actor_t *actor) {
     /* release resources */
-
-    for (int i = 0; i < actor->argc; i++)
-        sdsfree(actor->argv[i]);
 
     while (!list_empty(&actor->mailbox)) {
         struct list_node *node = list_dequeue(&actor->mailbox);
@@ -210,6 +208,8 @@ void free_actor(actor_t *actor) {
         sdsfree(msg->msg.payload);
         srfree(msg);
     }
+
+    VALGRIND_STACK_DEREGISTER(actor->valgrind_stk_id);
 
     /* Go back to the original allocated pointer. */
     char *p = (char *)actor - SHERRY_STACK_SIZE;
@@ -222,19 +222,22 @@ void *actor_stack(actor_t *a) { return a; }
 #define SHERRY_MAX_FD 1024
 
 typedef struct scheduler {
-    int sizeactors;     // the size of array actors
-    actor_t **actors;     // all register actors, indexed by actor id
-    actor_t *main;        // the fake main actor
-    actor_t *running;     // the current running actor
-    struct list readyq; // actors ready to run
+    int sizeactors;         // the size of array actors
+    int curractors;         // current registered actors
+    actor_t **actors;       // all register actors, indexed by actor id
+    actor_t *main;          // the fake main actor
+    actor_t *running;       // the current running actor
+    struct list readyq;     // actors ready to run
     struct list waitingmsg; // actors blocked on mailbox
     uv_loop_t loop;
+    char *tmpstack;         // temp stack for context switch
+    int valgrind_tstk_id;   // valgrind temp stack id
 } scheduler_t;
 
 scheduler_t *sche;
 
 /* Register a new actor to actors array. */
-actor_t *reg_actor(sherry_fn_t fn, int argc, char **argv) {
+actor_t *reg_actor(sherry_fn_t fn, void *argv) {
     /* TODO: O(n) now, make it O(1)? */
     int id = -1;
     for (int i = 0; i < sche->sizeactors; i++) {
@@ -255,8 +258,10 @@ actor_t *reg_actor(sherry_fn_t fn, int argc, char **argv) {
         id = oldsize;
     }
 
-    actor_t *actor = new_actor(id, fn, argc, argv);
+    actor_t *actor = new_actor(id, fn, argv);
     sche->actors[id] = actor;
+    sche->curractors++;
+
     return actor;
 }
 
@@ -268,6 +273,7 @@ void unreg_actor(int rid) {
     actor_t *rt = sche->actors[rid];
     free_actor(rt);
     sche->actors[rid] = NULL;
+    sche->curractors--;
 
     /* TODO: shrink the array size. */
 }
@@ -338,7 +344,8 @@ void yield(void) {
 #endif
 
 void start_running(void) {
-    sche->running->fn(sche->running->argc, sche->running->argv);
+    sherry_yield();
+    sche->running->fn(sche->running->argv);
 }
 
 void finish_running(void) {
@@ -346,13 +353,7 @@ void finish_running(void) {
      * scheduler. We should not free the memory of current stack, so we keep
      * a temp stack as a static variable and switch to it before we do the
      * cleanup job. */
-
-    const size_t sz = SHERRY_STACK_SIZE;
-    static char *tmpstack = NULL;
-
-    if (tmpstack == NULL) tmpstack = srmalloc(sz) + sz;
-
-    switchsp(tmpstack);
+    switchsp(sche->tmpstack);
 
     unreg_actor(sche->running->aid);
 
@@ -362,9 +363,9 @@ void finish_running(void) {
 
 /* Spawn a new actor, interrupt the current running actor and give the control
  * to the new spawned one. */
-int sherry_spawn(sherry_fn_t fn, int argc, char **argv) {
+int sherry_spawn(sherry_fn_t fn, void *argv) {
 
-    actor_t *newactor = reg_actor(fn, argc, argv);
+    actor_t *newactor = reg_actor(fn, argv);
 
     /* interrupt current running actor */
     actor_t *curr = sche->running;
@@ -451,13 +452,13 @@ struct sherry_msg *sherry_msg_recv(void) {
 #define SHERRY_EV_MAX   2
 
 typedef struct sherry_fd {
-    union { uv_tcp_t to_tcp; } handle;
     int type;
-    const uv_buf_t *rbuf; // read buffer
+    uv_buf_t rbuf; // read buffer
     size_t roffset; // read buffer offset
     int rerror; // read error
     struct list waitq[SHERRY_EV_MAX]; // blocked actors waiting for
                                       // different events
+    union uv_any_handle handle;
 } sherry_fd_t;
 
 sherry_fd_t *fdnew(int type) {
@@ -467,9 +468,13 @@ sherry_fd_t *fdnew(int type) {
 
     fd->type = type;
 
-    fd->rbuf = NULL;
+    fd->rbuf.base = NULL;
+    fd->rbuf.len = 0;
+
     fd->roffset = 0;
     fd->rerror = 0;
+
+    uv_handle_set_data((uv_handle_t *)&fd->handle, fd);
 
     for (int i = 0; i < SHERRY_EV_MAX; i++)
         list_init(&fd->waitq[i]);
@@ -478,15 +483,17 @@ sherry_fd_t *fdnew(int type) {
 }
 
 void fdfree(sherry_fd_t *fd) {
+    if (fd->rbuf.base)
+        srfree((void *)fd->rbuf.base);
     srfree(fd);
 }
 
 void close_cb(uv_handle_t *handle) {
-    fdfree((sherry_fd_t *)handle);
+    fdfree(handle->data);
 }
 
 int sherry_fd_close(sherry_fd_t *fd) {
-    uv_close((uv_handle_t *)&fd->handle, NULL);
+    uv_close((uv_handle_t *)&fd->handle, close_cb);
     return 0;
 }
 
@@ -506,8 +513,7 @@ sherry_fd_t *sherry_fd_tcp(void) {
         return NULL;
 
     /* setup libuv tcp handle */
-    uv_tcp_t *handle = &fd->handle.to_tcp;
-    uv_tcp_init(&sche->loop, handle);
+    uv_tcp_init(&sche->loop, &fd->handle.tcp);
 
     return fd;
 }
@@ -515,30 +521,30 @@ sherry_fd_t *sherry_fd_tcp(void) {
 int sherry_tcp_bind(sherry_fd_t *fd, const char *ip, int port) {
     struct sockaddr_in addr;
     uv_ip4_addr(ip, port, &addr);
-    return uv_tcp_bind(&fd->handle.to_tcp, (const struct sockaddr *)&addr, 0);
+    return uv_tcp_bind(&fd->handle.tcp, (const struct sockaddr *)&addr, 0);
 }
 
 int sherry_tcp_peername(sherry_fd_t *fd, struct sockaddr *name, int *namelen) {
-    return uv_tcp_getpeername(&fd->handle.to_tcp, name, namelen);
+    return uv_tcp_getpeername(&fd->handle.tcp, name, namelen);
 }
 
 void listen_cb(uv_stream_t *server, int status) {
     if (status < 0) {
         // TODO: handle error
     }
-    sherry_fd_t *fd = (sherry_fd_t *)server;
+    sherry_fd_t *fd = (sherry_fd_t *)server->data;
     unblock_all(&fd->waitq[SHERRY_EV_READ]);
 }
 
 int sherry_listen(sherry_fd_t *fd, int backlog) {
     if (fd == NULL || fd->type != SHERRY_FD_TCP)
         return SHERRY_ERR_INVALID;
-    return uv_listen((uv_stream_t *)fd, backlog, listen_cb);
+    return uv_listen(&fd->handle.stream, backlog, listen_cb);
 }
 
 int sherry_accept(sherry_fd_t *serverfd, sherry_fd_t *clientfd) {
     while (1) {
-        int err = uv_accept((uv_stream_t *)serverfd, (uv_stream_t *)clientfd);
+        int err = uv_accept(&serverfd->handle.stream, &clientfd->handle.stream);
         if (err >= 0 || err != UV_EAGAIN)
             return err;
         else /* we got UV_EAGAIN */
@@ -553,32 +559,34 @@ void rbuf_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 }
 
 void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-    sherry_fd_t *fd = (sherry_fd_t *)stream;
+    sherry_fd_t *fd = stream->data;
 
     /* From libuv document, nread < 0 when error, nread == 0 when nothing
      * read but everything ok. It's ok to set rerror to nread. */
     if (nread <= 0) {
         fd->rerror = nread;
+        srfree(buf->base);
         return;
     }
 
     /* When we reach this callback, the old buffer should not be used
      * anymore, reset it. */
-    if (fd->rbuf) {
-        srfree((void *)fd->rbuf);
-        fd->rbuf = NULL;
+    if (fd->rbuf.base) {
+        srfree((void *)fd->rbuf.base);
+        fd->rbuf.base = NULL;
+        fd->rbuf.len = 0;
         fd->roffset = 0;
     }
 
     /* We get a new buffer, set it and unblock all waiting actors. */
-    fd->rbuf = buf;
+    fd->rbuf = *buf;
 
     unblock_all(&fd->waitq[SHERRY_EV_READ]);
 }
 
 ssize_t sherry_read(sherry_fd_t *fd, void *buf, size_t count) {
     /* uv_read_start is re-entryable, just make sure it starts. */
-    int err = uv_read_start((uv_stream_t *)&fd->handle, rbuf_alloc, read_cb);
+    int err = uv_read_start(&fd->handle.stream, rbuf_alloc, read_cb);
     if (err)
         return err;
 
@@ -588,10 +596,10 @@ ssize_t sherry_read(sherry_fd_t *fd, void *buf, size_t count) {
 
         /* Buffer not empty, we only read from buffer. Now, If the remaining
          * size is less than count, we simply read all remaining bytes. */
-        if (fd->rbuf && fd->rbuf->len > fd->roffset) {
-            size_t remain = fd->rbuf->len - fd->roffset;
+        if (fd->rbuf.base && fd->rbuf.len > fd->roffset) {
+            size_t remain = fd->rbuf.len - fd->roffset;
             size_t nread  = (remain > count) ? count : remain;
-            memcpy(buf, fd->rbuf + fd->roffset, nread);
+            memcpy(buf, fd->rbuf.base + fd->roffset, nread);
             fd->roffset += nread;
             return nread;
         }
@@ -616,7 +624,7 @@ ssize_t sherry_write(sherry_fd_t *fd, const void *buf, size_t count) {
     uvbuf.base = (char *)buf;
     uvbuf.len = count;
 
-    uv_write(&req, (uv_stream_t *)&fd->handle, &uvbuf, 1, write_cb);
+    uv_write(&req, &fd->handle.stream, &uvbuf, 1, write_cb);
     current_actor()->status = SHERRY_STATE_WAIT_EV;
     yield();
 
@@ -629,26 +637,38 @@ void sherry_init(void) {
 
     const size_t sz = 1000; // initial S->actors size
     sche->sizeactors = sz;
+    sche->curractors = 0;
     sche->actors = srmalloc(sizeof(actor_t *) * sz);
     memset(sche->actors, 0, sizeof(actor_t *) * sz);
 
     /* set current running to the fake main routine. */
-    sche->main = reg_actor(NULL, 0, NULL);
+    sche->main = reg_actor(NULL, NULL);
     setrunning(sche->main);
 
     list_init(&sche->readyq);
     list_init(&sche->waitingmsg);
 
     uv_loop_init(&sche->loop);
+
+    char *p = srmalloc(SHERRY_STACK_SIZE);
+    sche->tmpstack = p + SHERRY_STACK_SIZE;
+    sche->valgrind_tstk_id = VALGRIND_STACK_REGISTER(p, p + SHERRY_STACK_SIZE);
 }
 
 void sherry_exit(void) {
     /* wait all ready actors exit. */
-    while (!list_empty(&sche->readyq))
+    while (sche->curractors > 1) {
         sherry_yield();
+    }
+
     unreg_actor(sche->main->aid);
     srfree(sche->actors);
+
     uv_loop_close(&sche->loop);
+
+    srfree(sche->tmpstack - SHERRY_STACK_SIZE);
+    VALGRIND_STACK_DEREGISTER(sche->valgrind_tstk_id);
+
     srfree(sche);
 }
 

@@ -19,12 +19,12 @@ void sherry_msg_free(struct sherry_msg *msg);
 
 #define SHERRY_MAIN_ID 0
 
-typedef void (*sherry_fn_t)(int, char **);
+typedef void (*sherry_fn_t)(void *);
 
 /* Unused arguments generate annoying warnings... */
 #define SHERRY_NOTUSED(V) ((void) V)
 
-int sherry_spawn(sherry_fn_t fn, int argc, char **argv);
+int sherry_spawn(sherry_fn_t fn, void *argv);
 void sherry_yield(void);
 void sherry_msg_send(int dst, int msgtype, sds payload);
 struct sherry_msg *sherry_msg_recv(void);

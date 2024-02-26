@@ -1,14 +1,10 @@
 #include "../sherry.h"
-#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <uv.h>
 
-void http_handler(int argc, char **argv) {
-    assert(argc == 1);
-
-    sherry_fd_t *client_fd;
-    sscanf(argv[0], "%p", &client_fd);
+void http_handler(void *argv) {
+    sherry_fd_t *client_fd = (sherry_fd_t *)argv;
 
     char request[1024];
     ssize_t bytes_read = sherry_read(client_fd, request, sizeof(request) - 1);
@@ -57,10 +53,7 @@ int main() {
             fprintf(stderr, "Error accept connection: %s\n", uv_strerror(err));
             continue;
         }
-        char ptr[32];
-        char *argv[1] = { ptr };
-        snprintf(ptr, sizeof(ptr), "%p", client_fd);
-        sherry_spawn(http_handler, 1, argv);
+        sherry_spawn(http_handler, client_fd);
     }
 
     sherry_exit();
