@@ -9,7 +9,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define USE_VALGRIND
+
+#if defined (USE_VALGRIND)
 #include <valgrind/valgrind.h>
+#define valgrind_stk_reg(start, end) VALGRIND_STACK_REGISTER(start, end)
+#define valgrind_stk_unreg(stkid) VALGRIND_STACK_DEREGISTER(stkid)
+#else
+#define valgrind_stk_reg(start, end) 0
+#define valgrind_stk_unreg(stkid)
+#endif
 
 #include <uv.h>
 
@@ -30,7 +39,6 @@ void srfree(void *p) {
     // printf("srfree at: %ld\n", p);
     free(p);
 }
-
 
 /* ============================================================================
  * Generic double linked list implementation.
@@ -247,7 +255,7 @@ actor_t *new_actor(sherry_fn_t fn, void *argv) {
     r->fn = fn;
     r->argv = argv;
 
-    r->valgrind_stk_id = VALGRIND_STACK_REGISTER(p, r);
+    r->valgrind_stk_id = valgrind_stk_reg(p, r);
 
     r->node.prev = NULL;
     r->node.next = NULL;
@@ -265,7 +273,7 @@ void free_actor(actor_t *actor) {
         srfree(msg);
     }
 
-    VALGRIND_STACK_DEREGISTER(actor->valgrind_stk_id);
+    valgrind_stk_unreg(actor->valgrind_stk_id);
 
     /* Go back to the original allocated pointer. */
     char *p = (char *)actor - SHERRY_STACK_SIZE;
@@ -668,7 +676,7 @@ void sherry_init(void) {
     uv_loop_init(&sche->loop);
 
     sche->tmpstack = srmalloc(SHERRY_STACK_SIZE);
-    sche->valgrind_tstk_id = VALGRIND_STACK_REGISTER(
+    sche->valgrind_tstk_id = valgrind_stk_reg(
             sche->tmpstack, sche->tmpstack + SHERRY_STACK_SIZE);
 
     _makecontext(&sche->ctx, schdule, sche->tmpstack, SHERRY_STACK_SIZE);
@@ -686,7 +694,7 @@ void sherry_exit(void) {
     uv_loop_close(&sche->loop);
 
     srfree(sche->tmpstack);
-    VALGRIND_STACK_DEREGISTER(sche->valgrind_tstk_id);
+    valgrind_stk_unreg(sche->valgrind_tstk_id);
 
     srfree(sche);
 }
