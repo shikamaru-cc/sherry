@@ -138,10 +138,11 @@ typedef struct context_t {
 } context_t;
 
 void _makecontext(context_t *ctx, void (*f)(), char *stack, size_t stacksz) {
-    stacksz = stacksz - (sizeof(void*)); // reverse room for ret address
+    stacksz = stacksz - (sizeof(void*)*2); // reverse room for ret address
     ctx->rsp = stack + stacksz;
     void **rsp = (void **)ctx->rsp;
     rsp[0] = (void *)f; // setup for ret
+    rsp[1] = (void *)0xfffff; // setup for ret
 }
 
 int _swapcontext(context_t *octx, context_t *ctx);
