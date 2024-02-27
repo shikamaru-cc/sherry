@@ -2,7 +2,6 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
-#include <setjmp.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <errno.h>
@@ -140,17 +139,27 @@ void sherry_msg_free(struct sherry_msg *msg) {
 }
 
 /* All posible actor status */
-#define SHERRY_STATE_DEAD       0
-#define SHERRY_STATE_READY      1
-#define SHERRY_STATE_RUNNING    2
-#define SHERRY_STATE_WAIT_MSG   3
-#define SHERRY_STATE_WAIT_RFD   4 // waiting readable fd
-#define SHERRY_STATE_WAIT_WFD   5 // waiting writable fd
-#define SHERRY_STATE_WAIT_EV    6
+#define SHERRY_STATE_NONE       0
+#define SHERRY_STATE_DEAD       1
+#define SHERRY_STATE_READY      2
+#define SHERRY_STATE_RUNNING    3
+#define SHERRY_STATE_WAIT_MSG   4
+#define SHERRY_STATE_WAIT_EV    5
 
-#define STATE_EV_ACCEPT 10
+#include <ucontext.h>
 
-typedef jmp_buf context;
+typedef ucontext_t context_t;
+
+void _makecontext(context_t *ctx, void (*f)(), char *stack, size_t stacksz) {
+    getcontext(ctx); // TODO: handle error
+    ctx->uc_stack.ss_sp = stack;
+    ctx->uc_stack.ss_size = stacksz;
+    makecontext(ctx, f, 0);
+}
+
+int _swapcontext(context_t *octx, context_t *ctx) {
+    return swapcontext(octx, ctx);
+}
 
 #define SHERRY_STACK_SIZE (10 * 4096)
 #define SHERRY_MAX_ARGC   20   // maximum arg number for spawning actor
@@ -168,7 +177,7 @@ typedef jmp_buf context;
 typedef struct actor {
     int aid;                   // routine id
     int status;                // actor current status
-    context ctx;               // actor running context
+    context_t ctx;
     sherry_fn_t fn;            // actor function
     void *argv;                // actor argument
     int valgrind_stk_id;
@@ -177,15 +186,15 @@ typedef struct actor {
                                // queue in the scheduler now.
 } actor_t;
 
-actor_t *new_actor(int rid, sherry_fn_t fn, void *argv) {
+actor_t *new_actor(sherry_fn_t fn, void *argv) {
     /* p is the original allocated pointer. */
     char *p = srmalloc(sizeof(actor_t) + SHERRY_STACK_SIZE);
 
     /* The first SHERRY_STACK_SIZE bytes are used as the actor's
      * stack. See the memory model above. */
     actor_t *r = (actor_t *)(p + SHERRY_STACK_SIZE);
-    r->aid = rid;
-    r->status = SHERRY_STATE_READY;
+    r->aid = -1;
+    r->status = SHERRY_STATE_NONE;
 
     r->fn = fn;
     r->argv = argv;
@@ -201,7 +210,6 @@ actor_t *new_actor(int rid, sherry_fn_t fn, void *argv) {
 
 void free_actor(actor_t *actor) {
     /* release resources */
-
     while (!list_empty(&actor->mailbox)) {
         struct list_node *node = list_dequeue(&actor->mailbox);
         struct msg_node *msg = get_cont(node, struct msg_node, node);
@@ -217,7 +225,7 @@ void free_actor(actor_t *actor) {
 }
 
 /* The pointer to the struct actor is also the start address of the stack */
-void *actor_stack(actor_t *a) { return a; }
+void *actor_stack(actor_t *a) { return (char *)a - SHERRY_STACK_SIZE; }
 
 #define SHERRY_MAX_FD 1024
 
@@ -230,6 +238,7 @@ typedef struct scheduler {
     struct list readyq;     // actors ready to run
     struct list waitingmsg; // actors blocked on mailbox
     uv_loop_t loop;
+    context_t ctx;
     char *tmpstack;         // temp stack for context switch
     int valgrind_tstk_id;   // valgrind temp stack id
 } scheduler_t;
@@ -237,7 +246,7 @@ typedef struct scheduler {
 scheduler_t *sche;
 
 /* Register a new actor to actors array. */
-actor_t *reg_actor(sherry_fn_t fn, void *argv) {
+actor_t *reg_actor(actor_t *actor) {
     /* TODO: O(n) now, make it O(1)? */
     int id = -1;
     for (int i = 0; i < sche->sizeactors; i++) {
@@ -258,7 +267,7 @@ actor_t *reg_actor(sherry_fn_t fn, void *argv) {
         id = oldsize;
     }
 
-    actor_t *actor = new_actor(id, fn, argv);
+    actor->aid = id;
     sche->actors[id] = actor;
     sche->curractors++;
 
@@ -270,8 +279,8 @@ void unreg_actor(int rid) {
     if (rid < 0 || rid >= sche->sizeactors || sche->actors[rid] == NULL)
         return;
 
-    actor_t *rt = sche->actors[rid];
-    free_actor(rt);
+    // actor_t *rt = sche->actors[rid];
+    // free_actor(rt);
     sche->actors[rid] = NULL;
     sche->curractors--;
 
@@ -310,13 +319,14 @@ void unblock_all(struct list *list) {
 }
 
 /* Resume one actor in the ready queue. */
-void resume(void) {
+void schdule(void) {
     while (1) {
         struct list_node *node = list_dequeue(&sche->readyq);
         actor_t *next = get_cont(node, actor_t, node);
         if (next != NULL) {
             setrunning(next);
-            siglongjmp(next->ctx, 1);
+            _swapcontext(&sche->ctx, &next->ctx);
+            continue;
         }
         uv_run(&sche->loop, UV_RUN_ONCE);
     }
@@ -328,68 +338,26 @@ void resume(void) {
  * before calling this function. */
 void yield(void) {
     actor_t *a = sche->running;
-    if (!sigsetjmp(a->ctx, 0))
-        resume();
+    int e = _swapcontext(&a->ctx, &sche->ctx);
+    assert(e == 0);
 }
 
-/* Assembly level code to switch current stack. This macro should satisfy any
- * supported architectures. */
-
-#if defined(__x86_64__)
-#define switchsp(sp) do {asm volatile ("movq %0, %%rsp" : : "r"(sp));} while(0)
-#endif
-
-#if defined(__aarch64__)
-#define switchsp(sp) do {asm volatile ("mov sp, %0" : : "r"(sp));} while(0)
-#endif
-
-void start_running(void) {
-    sherry_yield();
-    sche->running->fn(sche->running->argv);
-}
-
-void finish_running(void) {
-    /* The actor exits, we should release resources and give control back to
-     * scheduler. We should not free the memory of current stack, so we keep
-     * a temp stack as a static variable and switch to it before we do the
-     * cleanup job. */
-    switchsp(sche->tmpstack);
-
+void sherry_main(void) {
+    actor_t *actor = current_actor();
+    actor->fn(actor->argv);
     unreg_actor(sche->running->aid);
-
-    /* Give the control back to scheduler. */
-    resume();
+    yield();
 }
 
 /* Spawn a new actor, interrupt the current running actor and give the control
  * to the new spawned one. */
 int sherry_spawn(sherry_fn_t fn, void *argv) {
-
-    actor_t *newactor = reg_actor(fn, argv);
-
-    /* interrupt current running actor */
-    actor_t *curr = sche->running;
-    setready(curr);
-
-    if (sigsetjmp(curr->ctx, 0)) {
-        /* If the return value of sigsetjmp is greater than zero,
-         * it means that we go back to this saved context
-         * by siglongjmp, then we should return and continue
-         * the interrupted routine. */
-        return newactor->aid;
-    }
-
-    /* The return value of sigsetjmp is zero means that we continue the
-     * current context, spawn the new actor and run it. */
-    setrunning(newactor);
-
-    switchsp(actor_stack(newactor));
-
-    start_running();
-
-    finish_running();
-
-    return 0; // never reach here
+    actor_t *newactor = new_actor(fn, argv);
+    reg_actor(newactor);
+    setready(newactor);
+    _makecontext(&newactor->ctx, sherry_main,
+        actor_stack(newactor), SHERRY_STACK_SIZE);
+    return newactor->aid;
 }
 
 /* Put the current running actor to ready queue and yield. */
@@ -642,7 +610,8 @@ void sherry_init(void) {
     memset(sche->actors, 0, sizeof(actor_t *) * sz);
 
     /* set current running to the fake main routine. */
-    sche->main = reg_actor(NULL, NULL);
+    sche->main = new_actor(NULL, NULL);
+    reg_actor(sche->main);
     setrunning(sche->main);
 
     list_init(&sche->readyq);
@@ -650,9 +619,11 @@ void sherry_init(void) {
 
     uv_loop_init(&sche->loop);
 
-    char *p = srmalloc(SHERRY_STACK_SIZE);
-    sche->tmpstack = p + SHERRY_STACK_SIZE;
-    sche->valgrind_tstk_id = VALGRIND_STACK_REGISTER(p, p + SHERRY_STACK_SIZE);
+    sche->tmpstack = srmalloc(SHERRY_STACK_SIZE);
+    sche->valgrind_tstk_id = VALGRIND_STACK_REGISTER(
+            sche->tmpstack, sche->tmpstack + SHERRY_STACK_SIZE);
+
+    _makecontext(&sche->ctx, schdule, sche->tmpstack, SHERRY_STACK_SIZE);
 }
 
 void sherry_exit(void) {
@@ -666,7 +637,7 @@ void sherry_exit(void) {
 
     uv_loop_close(&sche->loop);
 
-    srfree(sche->tmpstack - SHERRY_STACK_SIZE);
+    srfree(sche->tmpstack);
     VALGRIND_STACK_DEREGISTER(sche->valgrind_tstk_id);
 
     srfree(sche);

@@ -71,7 +71,7 @@ void benchf(void *argv) {
 void bench_switch(void) {
     sherry_init();
     for (unsigned long i = 0; i < 10000; i++)
-        sherry_spawn(benchf, (void *)i);
+        sherry_spawn(benchf, (void *)1000);
     sherry_exit();
 }
 
