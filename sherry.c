@@ -120,6 +120,69 @@ struct list_node *list_dequeue(struct list *q) {
 }
 
 /* ============================================================================
+ * Low-level context switch stuff.
+ * ========================================================================== */
+
+#if defined (__x86_64__)
+
+typedef struct context_t {
+    void *rsp, *rbp, *rbx, *r12, *r13, *r14, *r15;
+} context_t;
+
+void _makecontext(context_t *ctx, void (*f)(), char *stack, size_t stacksz) {
+    stacksz = stacksz - (sizeof(void*)); // reverse room for ret address
+    ctx->rsp = stack + stacksz;
+    void **rsp = (void **)ctx->rsp;
+    rsp[0] = (void *)f; // setup for ret
+}
+
+int _swapcontext(context_t *octx, context_t *ctx);
+
+__asm__(
+    ".text\n"
+    ".globl _swapcontext\n"
+    "_swapcontext:\n"
+
+    "    movq %rsp,   (%rdi)\n"
+    "    movq %rbp,  8(%rdi)\n"
+    "    movq %rbx, 16(%rdi)\n"
+    "    movq %r12, 24(%rdi)\n"
+    "    movq %r13, 32(%rdi)\n"
+    "    movq %r14, 40(%rdi)\n"
+    "    movq %r15, 48(%rdi)\n"
+
+    "    movq   (%rsi), %rsp\n"
+    "    movq  8(%rsi), %rbp\n"
+    "    movq 16(%rsi), %rbx\n"
+    "    movq 24(%rsi), %r12\n"
+    "    movq 32(%rsi), %r13\n"
+    "    movq 40(%rsi), %r14\n"
+    "    movq 48(%rsi), %r15\n"
+
+    "    xor %rax, %rax\n"
+    "    ret\n"
+);
+
+#else
+
+#include <ucontext.h>
+
+typedef ucontext_t context_t;
+
+void _makecontext(context_t *ctx, void (*f)(), char *stack, size_t stacksz) {
+    getcontext(ctx); // TODO: handle error
+    ctx->uc_stack.ss_sp = stack;
+    ctx->uc_stack.ss_size = stacksz;
+    makecontext(ctx, f, 0);
+}
+
+int _swapcontext(context_t *octx, context_t *ctx) {
+    return swapcontext(octx, ctx);
+}
+
+#endif
+
+/* ============================================================================
  * Sherry actor model core implementation.
  * ========================================================================== */
 
@@ -145,21 +208,6 @@ void sherry_msg_free(struct sherry_msg *msg) {
 #define SHERRY_STATE_RUNNING    3
 #define SHERRY_STATE_WAIT_MSG   4
 #define SHERRY_STATE_WAIT_EV    5
-
-#include <ucontext.h>
-
-typedef ucontext_t context_t;
-
-void _makecontext(context_t *ctx, void (*f)(), char *stack, size_t stacksz) {
-    getcontext(ctx); // TODO: handle error
-    ctx->uc_stack.ss_sp = stack;
-    ctx->uc_stack.ss_size = stacksz;
-    makecontext(ctx, f, 0);
-}
-
-int _swapcontext(context_t *octx, context_t *ctx) {
-    return swapcontext(octx, ctx);
-}
 
 #define SHERRY_STACK_SIZE (10 * 4096)
 #define SHERRY_MAX_ARGC   20   // maximum arg number for spawning actor
