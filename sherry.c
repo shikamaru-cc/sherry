@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -9,7 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define USE_VALGRIND
+// #define USE_VALGRIND
 
 #if defined (USE_VALGRIND)
 #include <valgrind/valgrind.h>
@@ -128,6 +129,140 @@ struct list_node *list_dequeue(struct list *q) {
 }
 
 /* ============================================================================
+ * Generic map implementation.
+ * ========================================================================== */
+
+struct map_item {
+    uint8_t tag;
+    void *key;
+    void *val;
+};
+
+typedef unsigned int (*hash_fn) (const void *key);
+
+struct map {
+    /* base functions */
+    hash_fn hash;
+    int (*key_equal) (const void *a, const void *b);
+
+    unsigned int size;
+    unsigned int used;
+    unsigned int tomb;
+    struct map_item *items;
+};
+
+#define ITEM_FREE 0
+#define ITEM_USED 1
+#define ITEM_TOMB 2
+
+#define is_free(item) (item.tag == ITEM_FREE)
+#define is_used(item) (item.tag == ITEM_USED)
+#define is_tomb(item) (item.tag == ITEM_TOMB)
+
+#define MAP_INIT_SIZE 8
+
+#define map_len(m) ((m)->used - (m)->tomb)
+
+static void item_list_init(struct map_item *items, unsigned int size) {
+    for (unsigned int i = 0; i < size; i++)
+        items[i].tag = ITEM_FREE;
+}
+
+static void _map_init(struct map *map, unsigned int size, hash_fn hash) {
+    map->size = size;
+    map->used = 0;
+    map->tomb = 0;
+    map->hash = hash;
+    map->key_equal = NULL;
+    map->items  = srmalloc(sizeof(struct map_item) * size);
+    item_list_init(map->items, map->size);
+}
+
+void map_init(struct map *map, hash_fn hash) {
+    _map_init(map, MAP_INIT_SIZE, hash);
+}
+
+/* Finds the value for specified key. If found, the index of corresponding
+ * value will be return. Else, returns the first unused index.
+ * The returned index will never be invalid since our map should never be
+ * full. */
+static unsigned int map_find(struct map *map, void * key) {
+    /* Check following from github.com/cpnuj/clox code,
+     * I remember there is some size restriction for using operator '&'.
+     * unsigned int idx = map->hash(key) & (map->size - 1);
+     * idx = (idx + 1) % (map->size - 1); // open addressing */
+    unsigned int idx = map->hash(key) % map->size;
+    for (;;) {
+        struct map_item item = map->items[idx];
+        if (is_free(item))
+            return idx;
+        if (is_used(item) && map->key_equal(key, item.key))
+            return idx;
+        idx = (idx + 1) % map->size; // open addressing
+    }
+}
+
+void map_put(struct map *map, void * key, void * val);
+
+/* map_grow resizes the map's item list and rehash all the used items.
+ * The new size is 2 * used. */
+static void map_grow(struct map *map) {
+    struct map tmp;
+    _map_init(&tmp, map->size * 2, map->hash);
+    tmp.key_equal = map->key_equal;
+
+    for (unsigned int i = 0; i < map->size; i++) {
+        struct map_item item = map->items[i];
+        if (item.tag == ITEM_USED)
+            map_put(&tmp, item.key, item.val);
+    }
+
+    srfree(map->items);
+
+    map->size  = tmp.size;
+    map->used  = tmp.used;
+    map->tomb  = tmp.tomb;
+    map->items = tmp.items;
+}
+
+#define LOAD_FACTOR_MAX (0.9)
+
+void map_put(struct map *map, void *key, void *val) {
+    unsigned int idx = map_find(map, key);
+    if (is_free(map->items[idx]))
+        map->used++;
+
+    map->items[idx].tag = ITEM_USED;
+    map->items[idx].key = key;
+    map->items[idx].val = val;
+
+    /*If the load factor (used / size) is greater than LOAD_FACTOR_MAX,
+     * grows the map. */
+    float load_factor = (float)map->used / (float)map->size;
+    if (load_factor > LOAD_FACTOR_MAX)
+        map_grow(map);
+}
+
+int map_del(struct map *map, void * key) {
+    unsigned int idx = map_find(map, key);
+    if (is_free(map->items[idx]))
+        return 0;
+    map->items[idx].tag = ITEM_TOMB;
+    map->tomb++;
+    return 1;
+}
+
+int map_get(struct map *map, void *key, void **pval) {
+    unsigned int idx = map_find(map, key);
+    struct map_item item = map->items[idx];
+    if (is_free(item))
+        return 0;
+    if (pval != NULL)
+        *pval = item.val;
+    return 1;
+}
+
+/* ============================================================================
  * Low-level context switch stuff.
  * ========================================================================== */
 
@@ -174,6 +309,7 @@ __asm__(
 
 #else
 
+#define _XOPEN_SOURCE // for osx
 #include <ucontext.h>
 
 typedef ucontext_t context_t;
@@ -232,7 +368,7 @@ void sherry_msg_free(struct sherry_msg *msg) {
  * stack size.
  */
 typedef struct actor {
-    int aid;                   // routine id
+    uint64_t _aid;
     int status;                // actor current status
     context_t ctx;
     sherry_fn_t fn;            // actor function
@@ -250,7 +386,6 @@ actor_t *new_actor(sherry_fn_t fn, void *argv) {
     /* The first SHERRY_STACK_SIZE bytes are used as the actor's
      * stack. See the memory model above. */
     actor_t *r = (actor_t *)(p + SHERRY_STACK_SIZE);
-    r->aid = -1;
     r->status = SHERRY_STATE_NONE;
 
     r->fn = fn;
@@ -284,16 +419,12 @@ void free_actor(actor_t *actor) {
 /* The pointer to the struct actor is also the start address of the stack */
 void *actor_stack(actor_t *a) { return (char *)a - SHERRY_STACK_SIZE; }
 
-#define SHERRY_MAX_FD 1024
-
 typedef struct scheduler {
-    int sizeactors;         // the size of array actors
-    int curractors;         // current registered actors
-    actor_t **actors;       // all register actors, indexed by actor id
+    uint64_t nextaid;
+    struct map _actors;
     actor_t *main;          // the fake main actor
     actor_t *running;       // the current running actor
     struct list readyq;     // actors ready to run
-    struct list waitingmsg; // actors blocked on mailbox
     uv_loop_t loop;
     context_t ctx;
     char *tmpstack;         // temp stack for context switch
@@ -304,50 +435,23 @@ scheduler_t *sche;
 
 /* Register a new actor to actors array. */
 actor_t *reg_actor(actor_t *actor) {
-    /* TODO: O(n) now, make it O(1)? */
-    int id = -1;
-    for (int i = 0; i < sche->sizeactors; i++) {
-        if (sche->actors[i] == NULL) {
-            id = i;
-            break;
-        }
-    }
-
-    /* there is no available slot, realloc routines array. */
-    if (id == -1) {
-        size_t oldsize = sche->sizeactors;
-        size_t newsize = sche->sizeactors * 2;
-        sche->actors = srrealloc(sche->actors, newsize * sizeof(actor_t *));
-        memset(sche->actors + oldsize, 0,
-            (newsize - oldsize) * sizeof(actor_t *));
-        sche->sizeactors = newsize;
-        id = oldsize;
-    }
-
-    actor->aid = id;
-    sche->actors[id] = actor;
-    sche->curractors++;
-
+    actor->_aid = sche->nextaid++;
+    map_put(&sche->_actors, &actor->_aid, actor);
     return actor;
 }
 
 /* Unregister an actor from actors array. */
-void unreg_actor(int rid) {
-    if (rid < 0 || rid >= sche->sizeactors || sche->actors[rid] == NULL)
-        return;
-
-    // actor_t *rt = sche->actors[rid];
-    // free_actor(rt);
-    sche->actors[rid] = NULL;
-    sche->curractors--;
-
-    /* TODO: shrink the array size. */
+void unreg_actor(uint64_t aid) {
+    map_del(&sche->_actors, &aid);
 }
 
 actor_t *current_actor(void) { return sche->running; }
 
-actor_t *get_actor(int aid) {
-    return (aid < sche->sizeactors) ? sche->actors[aid] : NULL;
+actor_t *get_actor(uint64_t aid) {
+    actor_t *actor;
+    if (map_get(&sche->_actors, &aid, (void **)&actor))
+        return actor;
+    return NULL;
 }
 
 /* set the actor to running state and enqueue it to readyq. */
@@ -402,19 +506,19 @@ void yield(void) {
 void sherry_main(void) {
     actor_t *actor = current_actor();
     actor->fn(actor->argv);
-    unreg_actor(sche->running->aid);
+    unreg_actor(sche->running->_aid);
     yield();
 }
 
 /* Spawn a new actor, interrupt the current running actor and give the control
  * to the new spawned one. */
-int sherry_spawn(sherry_fn_t fn, void *argv) {
-    actor_t *newactor = new_actor(fn, argv);
+uint64_t sherry_spawn(sherry_fn_t fn, void *arg) {
+    actor_t *newactor = new_actor(fn, arg);
     reg_actor(newactor);
     setready(newactor);
     _makecontext(&newactor->ctx, sherry_main,
         actor_stack(newactor), SHERRY_STACK_SIZE);
-    return newactor->aid;
+    return newactor->_aid;
 }
 
 /* Put the current running actor to ready queue and yield. */
@@ -426,14 +530,17 @@ void sherry_yield(void) {
 /* Send a message to the receiver actor. This function never blocks the
  * running actor. This method will take the ownership for payload,
  * the caller should not use payload anymore. */
-void sherry_msg_send(int dst, int msgtype, sds payload) {
+void sherry_msg_send(uint64_t dst, int msgtype, sds payload) {
     actor_t *sender = sche->running;
-    actor_t *recver = sche->actors[dst]; // TODO: check the dst idx
+    actor_t *recver = get_actor(dst);
+
+    if (recver == NULL)
+        return; // TODO: return error?
 
     struct msg_node *msg = srmalloc(sizeof(*msg));
 
-    msg->msg.sender = sender->aid;
-    msg->msg.recver = recver->aid;
+    msg->msg.sender = sender->_aid;
+    msg->msg.recver = recver->_aid;
 
     msg->msg.msgtype = msgtype;
     msg->msg.payload = payload; // take ownership
@@ -444,7 +551,6 @@ void sherry_msg_send(int dst, int msgtype, sds payload) {
 
     /* Revoke the receiver actor if it is blocked. */
     if (recver->status == SHERRY_STATE_WAIT_MSG) {
-        list_erase(&sche->waitingmsg, &recver->node);
         setready(recver);
     }
 }
@@ -458,7 +564,6 @@ struct sherry_msg *sherry_msg_recv(void) {
     actor_t *a = sche->running;
     if (list_empty(&a->mailbox)) {
         a->status = SHERRY_STATE_WAIT_MSG;
-        list_enqueue(&sche->waitingmsg, &a->node);
         yield();
     }
     struct list_node *node = list_dequeue(&a->mailbox);
@@ -657,14 +762,20 @@ ssize_t sherry_write(sherry_fd_t *fd, const void *buf, size_t count) {
     return count;
 }
 
-void sherry_init(void) {
-    sche = srmalloc(sizeof(scheduler_t));
+unsigned int aidhash (const void *aid) {
+    return *(uint64_t *)aid;
+}
 
-    const size_t sz = 1000; // initial S->actors size
-    sche->sizeactors = sz;
-    sche->curractors = 0;
-    sche->actors = srmalloc(sizeof(actor_t *) * sz);
-    memset(sche->actors, 0, sizeof(actor_t *) * sz);
+int aid_equal(const void *aid1, const void *aid2) {
+    return *(uint64_t *)aid1 == *(uint64_t *)aid2;
+}
+
+void sherry_init(void) {
+    sche = srmalloc(sizeof(*sche));
+
+    sche->nextaid = 0;
+    map_init(&sche->_actors, aidhash);
+    sche->_actors.key_equal = aid_equal;
 
     /* set current running to the fake main routine. */
     sche->main = new_actor(NULL, NULL);
@@ -672,7 +783,6 @@ void sherry_init(void) {
     setrunning(sche->main);
 
     list_init(&sche->readyq);
-    list_init(&sche->waitingmsg);
 
     uv_loop_init(&sche->loop);
 
@@ -685,12 +795,11 @@ void sherry_init(void) {
 
 void sherry_exit(void) {
     /* wait all ready actors exit. */
-    while (sche->curractors > 1) {
+    while (map_len(&sche->_actors) > 1) {
         sherry_yield();
     }
 
-    unreg_actor(sche->main->aid);
-    srfree(sche->actors);
+    unreg_actor(sche->main->_aid);
 
     uv_loop_close(&sche->loop);
 

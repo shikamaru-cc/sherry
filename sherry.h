@@ -1,16 +1,15 @@
 #ifndef SHERRY_H
 #define SHERRY_H
 
-#include <stdlib.h>
-#include <stddef.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <uv.h>
 
 #include "sds.h"
 
 struct sherry_msg {
-    int sender;
-    int recver;
+    uint64_t sender;
+    uint64_t recver;
     int msgtype;
     sds payload;
 };
@@ -24,10 +23,11 @@ typedef void (*sherry_fn_t)(void *);
 /* Unused arguments generate annoying warnings... */
 #define SHERRY_NOTUSED(V) ((void) V)
 
-int sherry_spawn(sherry_fn_t fn, void *argv);
+uint64_t sherry_spawn(sherry_fn_t fn, void *arg);
 void sherry_yield(void);
-void sherry_msg_send(int dst, int msgtype, sds payload);
+void sherry_msg_send(uint64_t dst, int msgtype, sds payload);
 struct sherry_msg *sherry_msg_recv(void);
+int sherry_kill(int aid);
 
 struct sherry_fd;
 typedef struct sherry_fd sherry_fd_t;

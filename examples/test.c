@@ -37,7 +37,7 @@ void test_simple(void) {
 #define MSG_PING 100
 
 void pingf(void *argv) {
-    unsigned long dst = (unsigned long)argv;
+    uint64_t dst = (uint64_t)argv;
     printf("PING!\n");
     sherry_msg_send(dst, MSG_PING, NULL);
     /* send the second message which will not be processed,
@@ -57,7 +57,7 @@ void pongf(void *argv) {
 
 void test_message(void) {
     sherry_init();
-    intptr_t sid = sherry_spawn(pongf, NULL);
+    uint64_t sid = sherry_spawn(pongf, NULL);
     sherry_spawn(pingf, (void *)sid);
     sherry_exit();
 }
@@ -70,13 +70,13 @@ void benchf(void *argv) {
 
 void bench_switch(void) {
     sherry_init();
-    for (unsigned long i = 0; i < 10000; i++)
+    for (unsigned long i = 0; i < 1000000; i++)
         sherry_spawn(benchf, (void *)1000);
-    sherry_exit();
+    // sherry_exit();
 }
 
 int main(void) {
-    test_simple();
-    test_message();
+    // test_simple();
+    // test_message();
     bench_switch();
 }
